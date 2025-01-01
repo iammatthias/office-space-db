@@ -1,14 +1,14 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
+
 import time
 import smbus
 from datetime import datetime
 from dotenv import load_dotenv
-import sys
-import os
-# Add the project root directory to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 
 # Add the project root to PYTHONPATH
@@ -24,7 +24,8 @@ from python import LTR390    # UV
 from python import TSL2591   # Light
 from python import SGP40     # VOC
 
-from config import config
+# Import config module
+from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 
 # Optional display libraries (if needed)
 from PIL import Image, ImageDraw, ImageFont
@@ -65,9 +66,6 @@ print("BME280 T&H I2C address:    0x76")
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../config/.env'))
 
 # Initialize the Supabase client
-SUPABASE_URL = config.SUPABASE_URL
-SUPABASE_KEY = config.SUPABASE_KEY
-SAMPLE_RATE = config.SAMPLE_RATE
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 print("Starting data collection... Press Ctrl+C to exit.")
