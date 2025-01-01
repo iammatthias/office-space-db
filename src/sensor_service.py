@@ -3,153 +3,101 @@
 import time
 from datetime import datetime
 import os, sys
+import smbus
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 from supabase import create_client
-from typing import List, Dict, Any
-
-
-class MockSensor:
-    def read_accelerometer(self): return (0, 0, 0)
-    def read_gyroscope(self): return (0, 0, 0)
-    def read_magnetometer(self): return (0, 0, 0)
-    def read_temperature(self): return 20
-    def read_pressure(self): return 1000
-    def read_humidity(self): return 50
-    def read_uv(self): return 0
-    def read_lux(self): return 500
-    def read_voc(self): return 100
+from python import ICM20948, MPU925x, BME280, LTR390, TSL2591, SGP40
 
 
 class SensorService:
     def __init__(self):
         if not SUPABASE_URL or not SUPABASE_KEY:
             raise ValueError("Missing Supabase credentials")
-        
+
+        # Initialize Supabase client
         self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        self.mock = MockSensor()
 
-    def read_sensors(self) -> List[Dict[str, Any]]:
-        """
-        Reads mock sensor data and prepares it for insertion.
-        """
-        timestamp = datetime.utcnow()  # Use datetime object directly
-        return [
-            {
-                "sensor_id": "icm20948",
-                "timestamp": timestamp,
-                "temperature": None,
-                "humidity": None,
-                "pressure": None,
-                "light": None,
-                "uv": None,
-                "voc": None,
-                "accelerometer_x": ax,
-                "accelerometer_y": ay,
-                "accelerometer_z": az,
-                "gyroscope_x": gx,
-                "gyroscope_y": gy,
-                "gyroscope_z": gz,
-                "magnetometer_x": mx,
-                "magnetometer_y": my,
-                "magnetometer_z": mz,
-            }
-            for ax, ay, az, gx, gy, gz, mx, my, mz in [
-                (
-                    self.mock.read_accelerometer(),
-                    self.mock.read_gyroscope(),
-                    self.mock.read_magnetometer(),
-                )
-            ]
-        ] + [
-            {
-                "sensor_id": "bme280",
-                "timestamp": timestamp,
-                "temperature": self.mock.read_temperature(),
-                "humidity": self.mock.read_humidity(),
-                "pressure": self.mock.read_pressure(),
-                "light": None,
-                "uv": None,
-                "voc": None,
-                "accelerometer_x": None,
-                "accelerometer_y": None,
-                "accelerometer_z": None,
-                "gyroscope_x": None,
-                "gyroscope_y": None,
-                "gyroscope_z": None,
-                "magnetometer_x": None,
-                "magnetometer_y": None,
-                "magnetometer_z": None,
-            },
-            {
-                "sensor_id": "ltr390",
-                "timestamp": timestamp,
-                "temperature": None,
-                "humidity": None,
-                "pressure": None,
-                "light": None,
-                "uv": self.mock.read_uv(),
-                "voc": None,
-                "accelerometer_x": None,
-                "accelerometer_y": None,
-                "accelerometer_z": None,
-                "gyroscope_x": None,
-                "gyroscope_y": None,
-                "gyroscope_z": None,
-                "magnetometer_x": None,
-                "magnetometer_y": None,
-                "magnetometer_z": None,
-            },
-            {
-                "sensor_id": "tsl25911",
-                "timestamp": timestamp,
-                "temperature": None,
-                "humidity": None,
-                "pressure": None,
-                "light": self.mock.read_lux(),
-                "uv": None,
-                "voc": None,
-                "accelerometer_x": None,
-                "accelerometer_y": None,
-                "accelerometer_z": None,
-                "gyroscope_x": None,
-                "gyroscope_y": None,
-                "gyroscope_z": None,
-                "magnetometer_x": None,
-                "magnetometer_y": None,
-                "magnetometer_z": None,
-            },
-            {
-                "sensor_id": "sgp40",
-                "timestamp": timestamp,
-                "temperature": None,
-                "humidity": None,
-                "pressure": None,
-                "light": None,
-                "uv": None,
-                "voc": self.mock.read_voc(),
-                "accelerometer_x": None,
-                "accelerometer_y": None,
-                "accelerometer_z": None,
-                "gyroscope_x": None,
-                "gyroscope_y": None,
-                "gyroscope_z": None,
-                "magnetometer_x": None,
-                "magnetometer_y": None,
-                "magnetometer_z": None,
-            },
-        ]
+        # Initialize sensors
+        self.bus = smbus.SMBus(1)
+        self.icm_val_wia = 0xEA
+        self.mpu_val_wia = 0x71
+        self.icm_slave_address = 0x68
 
-    def store_data(self, readings: List[Dict[str, Any]]) -> None:
+        self.device_id1 = self.bus.read_byte_data(int(self.icm_slave_address), 0x00)
+        self.device_id2 = self.bus.read_byte_data(int(self.icm_slave_address), 0x75)
+
+        if self.device_id1 == self.icm_val_wia:
+            self.mpu = ICM20948.ICM20948()
+            print("ICM20948 detected at I2C address 0x68")
+        elif self.device_id2 == self.mpu_val_wia:
+            self.mpu = MPU925x.MPU925x()
+            print("MPU925x detected at I2C address 0x68")
+        else:
+            raise RuntimeError("No compatible IMU detected")
+
+        self.bme280 = BME280.BME280()
+        self.bme280.get_calib_param()
+        self.light = TSL2591.TSL2591()
+        self.uv = LTR390.LTR390()
+        self.sgp = SGP40.SGP40()
+
+        print("Sensors initialized successfully")
+
+    def read_sensors(self):
         """
-        Inserts validated sensor data into the database.
+        Reads data from all sensors and returns them as a dictionary.
         """
+        timestamp = datetime.utcnow()
+
         try:
-            if readings:
-                response = self.supabase.table("sensor_readings").insert(readings).execute()
-                print(f"Insert Response: {response}")
+            # Read BME280 (Temperature, Pressure, Humidity)
+            bme_data = self.bme280.readData()
+            pressure = round(bme_data[0], 2)
+            temp = round(bme_data[1], 2)
+            hum = round(bme_data[2], 2)
+
+            # Read TSL2591 (Light)
+            lux = round(self.light.Lux(), 2)
+
+            # Read LTR390 (UV)
+            uv_index = self.uv.UVS()
+
+            # Read SGP40 (VOC)
+            voc = round(self.sgp.raw(), 2)
+
+            # Read IMU (Gyroscope, Accelerometer, Magnetometer)
+            icm_data = self.mpu.getdata()
+            roll, pitch, yaw = icm_data[:3]
+            accel_x, accel_y, accel_z = icm_data[3:6]
+            gyro_x, gyro_y, gyro_z = icm_data[6:9]
+            mag_x, mag_y, mag_z = icm_data[9:12]
+
+            return [
+                {"timestamp": timestamp, "temperature": temp, "pressure": pressure, "humidity": hum,
+                 "light": lux, "uv": uv_index, "voc": voc,
+                 "accelerometer_x": accel_x, "accelerometer_y": accel_y, "accelerometer_z": accel_z,
+                 "gyroscope_x": gyro_x, "gyroscope_y": gyro_y, "gyroscope_z": gyro_z,
+                 "magnetometer_x": mag_x, "magnetometer_y": mag_y, "magnetometer_z": mag_z}
+            ]
+        except Exception as e:
+            print(f"Error reading sensors: {e}")
+            return []
+
+    def store_data(self, readings):
+        """
+        Stores the readings in Supabase.
+        """
+        if not readings:
+            print("No data to store")
+            return
+
+        try:
+            response = self.supabase.table("sensor_readings").insert(readings).execute()
+            if response.get("status_code") != 201:
+                print(f"Insert error: {response}")
             else:
-                print("No valid sensor data to store.")
+                print("Data successfully inserted")
         except Exception as e:
             print(f"Error storing data: {e}")
 
