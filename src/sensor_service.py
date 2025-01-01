@@ -45,19 +45,19 @@ class SensorService:
             mx, my, mz = self.mock.read_magnetometer()
             
             readings.extend([
-                {"sensor_id": "icm20948", "type": "accelerometer", "timestamp": timestamp, "values": {"x": ax, "y": ay, "z": az}, "value": None},
-                {"sensor_id": "icm20948", "type": "gyroscope", "timestamp": timestamp, "values": {"x": gx, "y": gy, "z": gz}, "value": None},
-                {"sensor_id": "icm20948", "type": "magnetometer", "timestamp": timestamp, "values": {"x": mx, "y": my, "z": mz}, "value": None}
+                {"sensor_id": "icm20948", "type": "accelerometer", "timestamp": timestamp, "values": [{"x": ax, "y": ay, "z": az}]},
+                {"sensor_id": "icm20948", "type": "gyroscope", "timestamp": timestamp, "values": [{"x": gx, "y": gy, "z": gz}]},
+                {"sensor_id": "icm20948", "type": "magnetometer", "timestamp": timestamp, "values": [{"x": mx, "y": my, "z": mz}]}
             ])
 
-            # Single value readings use "value"
+            # Single value readings as one-element arrays
             readings.extend([
-                {"sensor_id": "bme280", "type": "temperature", "timestamp": timestamp, "value": self.mock.read_temperature(), "values": None},
-                {"sensor_id": "bme280", "type": "pressure", "timestamp": timestamp, "value": self.mock.read_pressure(), "values": None},
-                {"sensor_id": "bme280", "type": "humidity", "timestamp": timestamp, "value": self.mock.read_humidity(), "values": None},
-                {"sensor_id": "ltr390", "type": "uv", "timestamp": timestamp, "value": self.mock.read_uv(), "values": None},
-                {"sensor_id": "tsl25911", "type": "light", "timestamp": timestamp, "value": self.mock.read_lux(), "values": None},
-                {"sensor_id": "sgp40", "type": "voc", "timestamp": timestamp, "value": self.mock.read_voc(), "values": None}
+                {"sensor_id": "bme280", "type": "temperature", "timestamp": timestamp, "values": [self.mock.read_temperature()]},
+                {"sensor_id": "bme280", "type": "pressure", "timestamp": timestamp, "values": [self.mock.read_pressure()]},
+                {"sensor_id": "bme280", "type": "humidity", "timestamp": timestamp, "values": [self.mock.read_humidity()]},
+                {"sensor_id": "ltr390", "type": "uv", "timestamp": timestamp, "values": [self.mock.read_uv()]},
+                {"sensor_id": "tsl25911", "type": "light", "timestamp": timestamp, "values": [self.mock.read_lux()]},
+                {"sensor_id": "sgp40", "type": "voc", "timestamp": timestamp, "values": [self.mock.read_voc()]}
             ])
         except Exception as e:
             print(f"Error reading sensors: {e}")
@@ -76,6 +76,7 @@ class SensorService:
         try:
             if validated_readings:
                 response = self.supabase.table("sensor_readings").insert(validated_readings).execute()
+                print(f"Insert Response: {response}")  # Log full response
                 if response.get("status_code") != 201:
                     print(f"Insert error: {response.get('data')}")
             else:
