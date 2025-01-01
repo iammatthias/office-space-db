@@ -30,40 +30,36 @@ class SensorService:
        self.mock = MockSensor()
 
    def read_sensors(self) -> Dict[str, Any]:
-       timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-       readings = []
+    timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    readings = []
 
-       try:
-           # ICM20948
-           ax, ay, az = self.mock.read_accelerometer() 
-           gx, gy, gz = self.mock.read_gyroscope()
-           mx, my, mz = self.mock.read_magnetometer()
-           
-           readings.extend([
-               {"sensor_id": "icm20948", "type": "accelerometer", "timestamp": timestamp, "values": {"x": ax, "y": ay, "z": az}},
-               {"sensor_id": "icm20948", "type": "gyroscope", "timestamp": timestamp, "values": {"x": gx, "y": gy, "z": gz}},
-               {"sensor_id": "icm20948", "type": "magnetometer", "timestamp": timestamp, "values": {"x": mx, "y": my, "z": mz}}
-           ])
+    try:
+        # ICM20948 - 3-axis readings use "values"
+        ax, ay, az = self.mock.read_accelerometer() 
+        gx, gy, gz = self.mock.read_gyroscope()
+        mx, my, mz = self.mock.read_magnetometer()
+        
+        readings.extend([
+            {"sensor_id": "icm20948", "type": "accelerometer", "timestamp": timestamp, "values": {"x": ax, "y": ay, "z": az}, "value": None},
+            {"sensor_id": "icm20948", "type": "gyroscope", "timestamp": timestamp, "values": {"x": gx, "y": gy, "z": gz}, "value": None},
+            {"sensor_id": "icm20948", "type": "magnetometer", "timestamp": timestamp, "values": {"x": mx, "y": my, "z": mz}, "value": None}
+        ])
 
-           # BME280 
-           readings.extend([
-               {"sensor_id": "bme280", "type": "temperature", "timestamp": timestamp, "value": self.mock.read_temperature()},
-               {"sensor_id": "bme280", "type": "pressure", "timestamp": timestamp, "value": self.mock.read_pressure()},
-               {"sensor_id": "bme280", "type": "humidity", "timestamp": timestamp, "value": self.mock.read_humidity()}
-           ])
+        # Single value readings use "value"
+        readings.extend([
+            {"sensor_id": "bme280", "type": "temperature", "timestamp": timestamp, "value": self.mock.read_temperature(), "values": None},
+            {"sensor_id": "bme280", "type": "pressure", "timestamp": timestamp, "value": self.mock.read_pressure(), "values": None},
+            {"sensor_id": "bme280", "type": "humidity", "timestamp": timestamp, "value": self.mock.read_humidity(), "values": None},
+            {"sensor_id": "ltr390", "type": "uv", "timestamp": timestamp, "value": self.mock.read_uv(), "values": None},
+            {"sensor_id": "tsl25911", "type": "light", "timestamp": timestamp, "value": self.mock.read_lux(), "values": None},
+            {"sensor_id": "sgp40", "type": "voc", "timestamp": timestamp, "value": self.mock.read_voc(), "values": None}
+        ])
 
-           # Other sensors
-           readings.extend([
-               {"sensor_id": "ltr390", "type": "uv", "timestamp": timestamp, "value": self.mock.read_uv()},
-               {"sensor_id": "tsl25911", "type": "light", "timestamp": timestamp, "value": self.mock.read_lux()},
-               {"sensor_id": "sgp40", "type": "voc", "timestamp": timestamp, "value": self.mock.read_voc()}
-           ])
-
-       except Exception as e:
-           print(f"Error reading sensors: {e}")
-       
-       return readings
-
+    except Exception as e:
+        print(f"Error reading sensors: {e}")
+    
+    return readings
+   
    def store_data(self, readings: list) -> None:
        if not readings:
            return
