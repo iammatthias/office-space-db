@@ -2,8 +2,6 @@
 # -*- coding:utf-8 -*-
 
 import sys
-print("Python interpreter:", sys.executable)
-print("sys.path:", sys.path)
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
