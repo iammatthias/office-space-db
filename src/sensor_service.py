@@ -21,7 +21,7 @@ from python import LTR390    # UV
 from python import TSL2591   # Light
 from python import SGP40     # VOC
 
-from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
+from config import config
 
 # Optional display libraries (if needed)
 from PIL import Image, ImageDraw, ImageFont
@@ -62,6 +62,9 @@ print("BME280 T&H I2C address:    0x76")
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../config/.env'))
 
 # Initialize the Supabase client
+SUPABASE_URL = config.SUPABASE_URL
+SUPABASE_KEY = config.SUPABASE_KEY
+SAMPLE_RATE = config.SAMPLE_RATE
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 print("Starting data collection... Press Ctrl+C to exit.")
