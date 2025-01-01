@@ -61,13 +61,14 @@ class SensorService:
     return readings
    
    def store_data(self, readings: list) -> None:
-       if not readings:
-           return
-           
-       try:
-           self.supabase.table("sensor_readings").insert(readings).execute()
-       except Exception as e:
-           print(f"Error storing data: {e}")
+    if not readings:
+        return
+    try:
+        response = self.supabase.auth.get_session()
+        print(f"Current role: {response}")
+        self.supabase.table("sensor_readings").insert(readings).execute()
+    except Exception as e:
+        print(f"Error storing data: {e}")
 
    def run(self):
        print(f"Starting sensor service, sampling every {SAMPLE_RATE} seconds")
