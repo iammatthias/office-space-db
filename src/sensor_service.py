@@ -9,6 +9,10 @@ from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 from supabase import create_client
 from typing import Dict, Any
 
+# Allowed sensor IDs based on RLS policy
+ALLOWED_SENSOR_IDS = {"icm20948", "bme280", "ltr390", "tsl25911", "sgp40"}
+
+
 class MockSensor:
     def read_accelerometer(self): return (0, 0, 0)
     def read_gyroscope(self): return (0, 0, 0)
@@ -20,6 +24,7 @@ class MockSensor:
     def read_lux(self): return 500
     def read_voc(self): return 100
     def get_calib_param(self): pass
+
 
 class SensorService:
     def __init__(self):
@@ -59,21 +64,20 @@ class SensorService:
         
         return readings
     
-    def validate_and_store_data(self, readings: list) -> None:
+    def store_data(self, readings: list) -> None:
         if not readings:
             return
 
         # Validate readings for RLS compliance
-        valid_sensor_ids = {"icm20948", "bme280", "ltr390", "tsl25911", "sgp40"}
         validated_readings = [
-            reading for reading in readings if reading["sensor_id"] in valid_sensor_ids
+            reading for reading in readings if reading["sensor_id"] in ALLOWED_SENSOR_IDS
         ]
 
         try:
             if validated_readings:
                 response = self.supabase.table("sensor_readings").insert(validated_readings).execute()
                 if response.get("status_code") != 201:
-                    print(f"Error storing data: {response.get('data')}")
+                    print(f"Insert error: {response.get('data')}")
             else:
                 print("No valid sensor data to store.")
         except Exception as e:
@@ -83,8 +87,9 @@ class SensorService:
         print(f"Starting sensor service, sampling every {SAMPLE_RATE} seconds")
         while True:
             readings = self.read_sensors()
-            self.validate_and_store_data(readings)
+            self.store_data(readings)
             time.sleep(SAMPLE_RATE)
+
 
 if __name__ == "__main__":
     service = SensorService()
