@@ -24,8 +24,11 @@ class SensorService:
         self.mpu_val_wia = 0x71
         self.icm_slave_address = 0x68
 
-        self.device_id1 = self.bus.read_byte_data(int(self.icm_slave_address), 0x00)
-        self.device_id2 = self.bus.read_byte_data(int(self.icm_slave_address), 0x75)
+        try:
+            self.device_id1 = self.bus.read_byte_data(self.icm_slave_address, 0x00)
+            self.device_id2 = self.bus.read_byte_data(self.icm_slave_address, 0x75)
+        except Exception as e:
+            raise RuntimeError(f"Error initializing I2C bus: {e}")
 
         if self.device_id1 == self.icm_val_wia:
             self.mpu = ICM20948.ICM20948()
@@ -48,7 +51,7 @@ class SensorService:
         """
         Reads data from all sensors and returns them as a dictionary.
         """
-        timestamp = datetime.utcnow()
+        timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
         try:
             # Read BME280 (Temperature, Pressure, Humidity)
@@ -73,16 +76,27 @@ class SensorService:
             gyro_x, gyro_y, gyro_z = icm_data[6:9]
             mag_x, mag_y, mag_z = icm_data[9:12]
 
-            return [
-                {"timestamp": timestamp, "temperature": temp, "pressure": pressure, "humidity": hum,
-                 "light": lux, "uv": uv_index, "voc": voc,
-                 "accelerometer_x": accel_x, "accelerometer_y": accel_y, "accelerometer_z": accel_z,
-                 "gyroscope_x": gyro_x, "gyroscope_y": gyro_y, "gyroscope_z": gyro_z,
-                 "magnetometer_x": mag_x, "magnetometer_y": mag_y, "magnetometer_z": mag_z}
-            ]
+            return {
+                "timestamp": timestamp,
+                "temperature": temp,
+                "pressure": pressure,
+                "humidity": hum,
+                "light": lux,
+                "uv": uv_index,
+                "voc": voc,
+                "accelerometer_x": accel_x,
+                "accelerometer_y": accel_y,
+                "accelerometer_z": accel_z,
+                "gyroscope_x": gyro_x,
+                "gyroscope_y": gyro_y,
+                "gyroscope_z": gyro_z,
+                "magnetometer_x": mag_x,
+                "magnetometer_y": mag_y,
+                "magnetometer_z": mag_z
+            }
         except Exception as e:
             print(f"Error reading sensors: {e}")
-            return []
+            return {}
 
     def store_data(self, readings):
         """
@@ -93,7 +107,7 @@ class SensorService:
             return
 
         try:
-            response = self.supabase.table("sensor_readings").insert(readings).execute()
+            response = self.supabase.table("sensor_readings").insert([readings]).execute()
             if response.get("status_code") != 201:
                 print(f"Insert error: {response}")
             else:
