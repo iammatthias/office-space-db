@@ -1,131 +1,167 @@
-#!/usr/bin/env python3
+#!/usr/bin/python
+# -*- coding:utf-8 -*-
 
 import time
-from datetime import datetime
-import os, sys
+import os
 import smbus
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
-from supabase import create_client
-from python import ICM20948, MPU925x, BME280, LTR390, TSL2591, SGP40
+import psycopg2
 
+from python import ICM20948  # Gyroscope/Acceleration/Magnetometer
+from python import MPU925x   # Gyroscope/Acceleration/Magnetometer
+from python import BME280    # Atmospheric Pressure/Temperature/Humidity
+from python import LTR390    # UV
+from python import TSL2591   # Light
+from python import SGP40     # VOC
 
-class SensorService:
-    def __init__(self):
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise ValueError("Missing Supabase credentials")
+from PIL import Image, ImageDraw, ImageFont
 
-        # Initialize Supabase client
-        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+MPU_VAL_WIA       = 0x71
+MPU_ADD_WIA       = 0x75
+ICM_VAL_WIA       = 0xEA
+ICM_ADD_WIA       = 0x00
+ICM_SLAVE_ADDRESS = 0x68
 
-        # Initialize sensors
-        self.bus = smbus.SMBus(1)
-        self.icm_val_wia = 0xEA
-        self.mpu_val_wia = 0x71
-        self.icm_slave_address = 0x68
+bus = smbus.SMBus(1)
 
-        try:
-            self.device_id1 = self.bus.read_byte_data(self.icm_slave_address, 0x00)
-            self.device_id2 = self.bus.read_byte_data(self.icm_slave_address, 0x75)
-        except Exception as e:
-            raise RuntimeError(f"Error initializing I2C bus: {e}")
+bme280 = BME280.BME280()
+bme280.get_calib_param()
 
-        if self.device_id1 == self.icm_val_wia:
-            self.mpu = ICM20948.ICM20948()
-            print("ICM20948 detected at I2C address 0x68")
-        elif self.device_id2 == self.mpu_val_wia:
-            self.mpu = MPU925x.MPU925x()
-            print("MPU925x detected at I2C address 0x68")
-        else:
-            raise RuntimeError("No compatible IMU detected")
+light = TSL2591.TSL2591()
+uv = LTR390.LTR390()
+sgp = SGP40.SGP40()
 
-        self.bme280 = BME280.BME280()
-        self.bme280.get_calib_param()
-        self.light = TSL2591.TSL2591()
-        self.uv = LTR390.LTR390()
-        self.sgp = SGP40.SGP40()
+device_id1 = bus.read_byte_data(ICM_SLAVE_ADDRESS, ICM_ADD_WIA)
+device_id2 = bus.read_byte_data(ICM_SLAVE_ADDRESS, MPU_ADD_WIA)
 
-        print("Sensors initialized successfully")
+if device_id1 == ICM_VAL_WIA:
+    mpu = ICM20948.ICM20948()
+    print("ICM20948 9-DOF I2C address: 0x68")
+elif device_id2 == MPU_VAL_WIA:
+    mpu = MPU925x.MPU925x()
+    print("MPU925x 9-DOF I2C address: 0x68")
 
-    def read_sensors(self):
-        """
-        Reads data from all sensors and returns them as a dictionary.
-        """
-        timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+print("TSL2591 Light I2C address: 0x29")
+print("LTR390 UV I2C address:     0x53")
+print("SGP40 VOC I2C address:     0x59")
+print("BME280 T&H I2C address:    0x76")
 
-        try:
-            # Read BME280 (Temperature, Pressure, Humidity)
-            bme_data = self.bme280.readData()
-            pressure = round(bme_data[0], 2)
-            temp = round(bme_data[1], 2)
-            hum = round(bme_data[2], 2)
+SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL", "postgresql://YOUR_USER:YOUR_PASSWORD@YOUR_HOST:5432/YOUR_DB?sslmode=require")
 
-            # Read TSL2591 (Light)
-            lux = round(self.light.Lux(), 2)
+try:
+    conn = psycopg2.connect(SUPABASE_DB_URL)
+    conn.autocommit = True
+    cursor = conn.cursor()
 
-            # Read LTR390 (UV)
-            uv_index = self.uv.UVS()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS environmental_data (
+            time        TIMESTAMPTZ NOT NULL,
+            pressure    DOUBLE PRECISION,
+            temp        DOUBLE PRECISION,
+            hum         DOUBLE PRECISION,
+            lux         DOUBLE PRECISION,
+            uv          DOUBLE PRECISION,
+            gas         DOUBLE PRECISION,
+            roll        DOUBLE PRECISION,
+            pitch       DOUBLE PRECISION,
+            yaw         DOUBLE PRECISION,
+            accel_x     INTEGER,
+            accel_y     INTEGER,
+            accel_z     INTEGER,
+            gyro_x      INTEGER,
+            gyro_y      INTEGER,
+            gyro_z      INTEGER,
+            mag_x       INTEGER,
+            mag_y       INTEGER,
+            mag_z       INTEGER
+        );
+    """)
 
-            # Read SGP40 (VOC)
-            voc = round(self.sgp.raw(), 2)
+    cursor.execute("""
+        SELECT create_hypertable('environmental_data', 'time', if_not_exists => TRUE);
+    """)
 
-            # Read IMU (Gyroscope, Accelerometer, Magnetometer)
-            icm_data = self.mpu.getdata()
-            roll, pitch, yaw = icm_data[:3]
-            accel_x, accel_y, accel_z = icm_data[3:6]
-            gyro_x, gyro_y, gyro_z = icm_data[6:9]
-            mag_x, mag_y, mag_z = icm_data[9:12]
+    print("Starting data collection... Press Ctrl+C to exit.")
+    while True:
+        bme = bme280.readData()
+        pressure = round(bme[0], 2)
+        temp = round(bme[1], 2)
+        hum = round(bme[2], 2)
+        lux_val = round(light.Lux(), 2)
+        uvs = uv.UVS()
+        gas_val = round(sgp.raw(), 2)
+        icm = mpu.getdata()  # [roll, pitch, yaw, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z]
 
-            return {
-                "timestamp": timestamp,
-                "temperature": temp,
-                "pressure": pressure,
-                "humidity": hum,
-                "light": lux,
-                "uv": uv_index,
-                "voc": voc,
-                "accelerometer_x": accel_x,
-                "accelerometer_y": accel_y,
-                "accelerometer_z": accel_z,
-                "gyroscope_x": gyro_x,
-                "gyroscope_y": gyro_y,
-                "gyroscope_z": gyro_z,
-                "magnetometer_x": mag_x,
-                "magnetometer_y": mag_y,
-                "magnetometer_z": mag_z
-            }
-        except Exception as e:
-            print(f"Error reading sensors: {e}")
-            return {}
+        print("=============================================")
+        print(f"pressure : {pressure} hPa")
+        print(f"temp     : {temp} ℃")
+        print(f"hum      : {hum} %")
+        print(f"lux      : {lux_val}")
+        print(f"uv       : {uvs}")
+        print(f"gas      : {gas_val}")
+        print(f"Roll     : {icm[0]:.2f}, Pitch: {icm[1]:.2f}, Yaw: {icm[2]:.2f}")
+        print(f"Accel    : X = {icm[3]}, Y = {icm[4]}, Z = {icm[5]}")
+        print(f"Gyro     : X = {icm[6]}, Y = {icm[7]}, Z = {icm[8]}")
+        print(f"Mag      : X = {icm[9]}, Y = {icm[10]}, Z = {icm[11]}")
 
-    def store_data(self, readings):
-        """
-        Stores the readings in Supabase.
-        """
-        if not readings:
-            print("No data to store")
-            return
+        cursor.execute("""
+            INSERT INTO environmental_data (
+                time,
+                pressure,
+                temp,
+                hum,
+                lux,
+                uv,
+                gas,
+                roll,
+                pitch,
+                yaw,
+                accel_x,
+                accel_y,
+                accel_z,
+                gyro_x,
+                gyro_y,
+                gyro_z,
+                mag_x,
+                mag_y,
+                mag_z
+            )
+            VALUES (
+                NOW(),
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s
+            );
+        """, (
+            pressure,
+            temp,
+            hum,
+            lux_val,
+            float(uvs),
+            gas_val,
+            icm[0],
+            icm[1],
+            icm[2],
+            icm[3],
+            icm[4],
+            icm[5],
+            icm[6],
+            icm[7],
+            icm[8],
+            icm[9],
+            icm[10],
+            icm[11]
+        ))
 
-        try:
-            response = self.supabase.table("sensor_readings").insert([readings]).execute()
-            if response.get("status_code") != 201:
-                print(f"Insert error: {response}")
-            else:
-                print("Data successfully inserted")
-        except Exception as e:
-            print(f"Error storing data: {e}")
+        time.sleep(60)
 
-    def run(self):
-        """
-        Main loop to collect and store sensor data at regular intervals.
-        """
-        print(f"Starting sensor service, sampling every {SAMPLE_RATE} seconds")
-        while True:
-            readings = self.read_sensors()
-            self.store_data(readings)
-            time.sleep(SAMPLE_RATE)
-
-
-if __name__ == "__main__":
-    service = SensorService()
-    service.run()
+except KeyboardInterrupt:
+    print("Exiting...")
+except Exception as e:
+    print(f"Error: {e}")
+finally:
+    if 'cursor' in globals():
+        cursor.close()
+    if 'conn' in globals():
+        conn.close()
