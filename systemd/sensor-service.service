@@ -1,0 +1,17 @@
+[Unit]
+Description=Environmental Sensor Data Collection
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/office-space
+Environment=PYTHONPATH=/usr/local/lib/python3.9/site-packages
+EnvironmentFile=/home/pi/office-space/config/.env
+ExecStart=/usr/bin/python3 /home/pi/office-space/src/sensor_service.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

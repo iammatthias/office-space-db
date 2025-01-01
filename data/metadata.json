@@ -1,0 +1,58 @@
+{
+  "sensors": [
+    {
+      "name": "ICM20948",
+      "id": "icm20948",
+      "i2c_address": "0x68",
+      "description": "9-axis motion tracking device for precise movement and orientation detection",
+      "measurements": ["accelerometer", "gyroscope", "magnetometer"],
+      "specs": {
+        "accelerometer": { "resolution": "16-bit", "range": "±2, ±4, ±8, ±16g" },
+        "gyroscope": { "resolution": "16-bit", "range": "±250, ±500, ±1000, ±2000°/sec" },
+        "magnetometer": { "resolution": "16-bit", "range": "±4900µT" }
+      }
+    },
+    {
+      "name": "BME280",
+      "id": "bme280",
+      "i2c_address": "0x76",
+      "description": "Environmental sensor for ambient temperature, humidity, and atmospheric pressure monitoring",
+      "measurements": ["temperature", "pressure", "humidity"],
+      "specs": {
+        "temperature": { "resolution": "0.01°C", "range": "-40~85°C" },
+        "pressure": { "resolution": "0.18Pa", "range": "300~1100hPa" },
+        "humidity": { "resolution": "0.008%RH", "range": "0~100%RH" }
+      }
+    },
+    {
+      "name": "LTR390",
+      "id": "ltr390",
+      "i2c_address": "0x53",
+      "description": "UV light sensor for measuring ultraviolet radiation exposure",
+      "measurements": ["uv"],
+      "specs": {
+        "uv": { "range": "280nm-430nm" }
+      }
+    },
+    {
+      "name": "TSL25911",
+      "id": "tsl25911",
+      "i2c_address": "0x29",
+      "description": "Digital light sensor for ambient light detection and measurement",
+      "measurements": ["light"],
+      "specs": {
+        "light": { "range": "0~88000Lux" }
+      }
+    },
+    {
+      "name": "SGP40",
+      "id": "sgp40",
+      "i2c_address": "0x60",
+      "description": "VOC sensor for indoor air quality monitoring",
+      "measurements": ["voc"],
+      "specs": {
+        "voc": { "range": "0~1000ppm ethanol equivalent" }
+      }
+    }
+  ]
+}
