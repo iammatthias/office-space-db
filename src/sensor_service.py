@@ -3,7 +3,7 @@
 import time
 from datetime import datetime
 import os, sys
-import smbus
+import smbus2 as smbus
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 from supabase import create_client
