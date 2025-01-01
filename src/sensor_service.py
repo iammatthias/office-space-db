@@ -16,15 +16,22 @@ from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Constants for I2C devices
-MPU_VAL_WIA = 0x71
-MPU_ADD_WIA = 0x75
-ICM_VAL_WIA = 0xEA
-ICM_ADD_WIA = 0x00
-ICM_SLAVE_ADDRESS = 0x68
+MPU_VAL_WIA = 0x71  # MPU925x ID
+MPU_ADD_WIA = 0x75  # MPU925x WHO_AM_I register
+ICM_VAL_WIA = 0xEA  # ICM20948 ID
+ICM_ADD_WIA = 0x00  # ICM20948 WHO_AM_I register
+ICM_SLAVE_ADDRESS = 0x68  # I2C address for both MPU925x and ICM20948
 
+# Other sensor I2C addresses
+TSL2591_I2C_ADDRESS = 0x29
+LTR390_I2C_ADDRESS = 0x53
+SGP40_I2C_ADDRESS = 0x59
+BME280_I2C_ADDRESS = 0x76
+
+# Initialize the I2C bus
 bus = smbus.SMBus(1)
 
-# Initialize sensors with error handling
+# Initialize sensors
 try:
     bme280 = BME280.BME280()
     bme280.get_calib_param()
@@ -38,14 +45,17 @@ except Exception as e:
 
 # Identify MPU/ICM device
 try:
+    time.sleep(0.1)  # Allow I2C bus to stabilize
     device_id1 = bus.read_byte_data(ICM_SLAVE_ADDRESS, ICM_ADD_WIA)
     device_id2 = bus.read_byte_data(ICM_SLAVE_ADDRESS, MPU_ADD_WIA)
+    print(f"Detected IDs: device_id1=0x{device_id1:02X}, device_id2=0x{device_id2:02X}")
+
     if device_id1 == ICM_VAL_WIA:
         mpu = ICM20948.ICM20948()
-        print("ICM20948 9-DOF I2C address: 0x68")
+        print("ICM20948 detected at I2C address: 0x68")
     elif device_id2 == MPU_VAL_WIA:
         mpu = MPU925x.MPU925x()
-        print("MPU925x 9-DOF I2C address: 0x68")
+        print("MPU925x detected at I2C address: 0x68")
     else:
         print("No compatible MPU/ICM device found.")
         sys.exit(1)
