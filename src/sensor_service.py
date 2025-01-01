@@ -28,47 +28,55 @@ class SensorService:
        
        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
        self.mock = MockSensor()
+       self.authenticate()
+
+   def authenticate(self):
+       # Replace with a valid Supabase email and password
+       email = "your_user_email@example.com"
+       password = "your_user_password"
+       response = self.supabase.auth.sign_in_with_password({"email": email, "password": password})
+       if not response.get("user"):
+           raise ValueError("Authentication failed")
+       print(f"Authenticated as: {response['user']['email']}")
 
    def read_sensors(self) -> Dict[str, Any]:
-    timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    readings = []
+       timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+       readings = []
 
-    try:
-        # ICM20948 - 3-axis readings use "values"
-        ax, ay, az = self.mock.read_accelerometer() 
-        gx, gy, gz = self.mock.read_gyroscope()
-        mx, my, mz = self.mock.read_magnetometer()
-        
-        readings.extend([
-            {"sensor_id": "icm20948", "type": "accelerometer", "timestamp": timestamp, "values": {"x": ax, "y": ay, "z": az}, "value": None},
-            {"sensor_id": "icm20948", "type": "gyroscope", "timestamp": timestamp, "values": {"x": gx, "y": gy, "z": gz}, "value": None},
-            {"sensor_id": "icm20948", "type": "magnetometer", "timestamp": timestamp, "values": {"x": mx, "y": my, "z": mz}, "value": None}
-        ])
+       try:
+           # ICM20948 - 3-axis readings use "values"
+           ax, ay, az = self.mock.read_accelerometer()
+           gx, gy, gz = self.mock.read_gyroscope()
+           mx, my, mz = self.mock.read_magnetometer()
+           
+           readings.extend([
+               {"sensor_id": "icm20948", "type": "accelerometer", "timestamp": timestamp, "values": {"x": ax, "y": ay, "z": az}, "value": None},
+               {"sensor_id": "icm20948", "type": "gyroscope", "timestamp": timestamp, "values": {"x": gx, "y": gy, "z": gz}, "value": None},
+               {"sensor_id": "icm20948", "type": "magnetometer", "timestamp": timestamp, "values": {"x": mx, "y": my, "z": mz}, "value": None}
+           ])
 
-        # Single value readings use "value"
-        readings.extend([
-            {"sensor_id": "bme280", "type": "temperature", "timestamp": timestamp, "value": self.mock.read_temperature(), "values": None},
-            {"sensor_id": "bme280", "type": "pressure", "timestamp": timestamp, "value": self.mock.read_pressure(), "values": None},
-            {"sensor_id": "bme280", "type": "humidity", "timestamp": timestamp, "value": self.mock.read_humidity(), "values": None},
-            {"sensor_id": "ltr390", "type": "uv", "timestamp": timestamp, "value": self.mock.read_uv(), "values": None},
-            {"sensor_id": "tsl25911", "type": "light", "timestamp": timestamp, "value": self.mock.read_lux(), "values": None},
-            {"sensor_id": "sgp40", "type": "voc", "timestamp": timestamp, "value": self.mock.read_voc(), "values": None}
-        ])
+           # Single value readings use "value"
+           readings.extend([
+               {"sensor_id": "bme280", "type": "temperature", "timestamp": timestamp, "value": self.mock.read_temperature(), "values": None},
+               {"sensor_id": "bme280", "type": "pressure", "timestamp": timestamp, "value": self.mock.read_pressure(), "values": None},
+               {"sensor_id": "bme280", "type": "humidity", "timestamp": timestamp, "value": self.mock.read_humidity(), "values": None},
+               {"sensor_id": "ltr390", "type": "uv", "timestamp": timestamp, "value": self.mock.read_uv(), "values": None},
+               {"sensor_id": "tsl25911", "type": "light", "timestamp": timestamp, "value": self.mock.read_lux(), "values": None},
+               {"sensor_id": "sgp40", "type": "voc", "timestamp": timestamp, "value": self.mock.read_voc(), "values": None}
+           ])
 
-    except Exception as e:
-        print(f"Error reading sensors: {e}")
-    
-    return readings
+       except Exception as e:
+           print(f"Error reading sensors: {e}")
+       
+       return readings
    
    def store_data(self, readings: list) -> None:
-    if not readings:
-        return
-    try:
-        response = self.supabase.auth.get_session()
-        print(f"Current role: {response}")
-        self.supabase.table("sensor_readings").insert(readings).execute()
-    except Exception as e:
-        print(f"Error storing data: {e}")
+       if not readings:
+           return
+       try:
+           self.supabase.table("sensor_readings").insert(readings).execute()
+       except Exception as e:
+           print(f"Error storing data: {e}")
 
    def run(self):
        print(f"Starting sensor service, sampling every {SAMPLE_RATE} seconds")
