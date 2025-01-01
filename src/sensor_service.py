@@ -6,6 +6,10 @@ import os
 import smbus
 from datetime import datetime
 from dotenv import load_dotenv
+import sys
+
+# Add the script's parent directory to the Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 # Supabase Python client
 from supabase import create_client, Client
