@@ -2,12 +2,14 @@
 # -*- coding:utf-8 -*-
 
 import time
-import os
 import smbus
 from datetime import datetime
 from dotenv import load_dotenv
 import sys
-sys.path.insert(0, '/home/pi/office-space-db')
+import os
+# Add the project root directory to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
+
 
 # Add the project root to PYTHONPATH
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
