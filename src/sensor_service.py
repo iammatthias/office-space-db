@@ -52,7 +52,9 @@ print("BME280 T&H I2C address:    0x76")
 # -----------------------------------------------------------------------------
 # Load environment variables from .env
 # -----------------------------------------------------------------------------
-load_dotenv()  # Automatically loads SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE, etc. from .env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../config/.env'))
+print("SUPABASE_URL:", SUPABASE_URL)
+print("SUPABASE_KEY:", SUPABASE_KEY)
 
 # -----------------------------------------------------------------------------
 # Set up the Supabase client
