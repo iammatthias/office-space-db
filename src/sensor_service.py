@@ -103,7 +103,7 @@ try:
 
         # Insert data into Supabase
         data_to_insert = {
-            "time": datetime.utcnow(),
+           "time": datetime.utcnow().isoformat(),
             "pressure": pressure,
             "temp": temp,
             "hum": hum,
