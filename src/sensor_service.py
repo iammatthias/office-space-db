@@ -4,6 +4,7 @@
 import time
 import os
 import smbus
+from dotenv import load_dotenv
 
 # Supabase Python client
 from supabase import create_client, Client
@@ -49,13 +50,20 @@ print("SGP40 VOC I2C address:     0x59")
 print("BME280 T&H I2C address:    0x76")
 
 # -----------------------------------------------------------------------------
+# Load environment variables from .env
+# -----------------------------------------------------------------------------
+load_dotenv()  # Automatically loads SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE, etc. from .env
+
+# -----------------------------------------------------------------------------
 # Set up the Supabase client
 # Replace with your actual values or rely on environment variables.
 # -----------------------------------------------------------------------------
-SUPABASE_URL      = os.environ.get("SUPABASE_URL", "<YOUR_SUPABASE_URL>")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "<YOUR_SUPABASE_ANON_KEY>")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SAMPLE_RATE  = int(os.getenv("SAMPLE_RATE", 60))
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+# Initialize the Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 print("Starting data collection... Press Ctrl+C to exit.")
 
