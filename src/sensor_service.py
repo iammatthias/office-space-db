@@ -8,7 +8,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import sys
 
-# Add the script's parent directory to the Python path
+# Add the project root to PYTHONPATH
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 # Supabase Python client
@@ -20,6 +20,8 @@ from python import BME280    # Atmospheric Pressure/Temperature/Humidity
 from python import LTR390    # UV
 from python import TSL2591   # Light
 from python import SGP40     # VOC
+
+from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 
 # Optional display libraries (if needed)
 from PIL import Image, ImageDraw, ImageFont
@@ -58,14 +60,6 @@ print("BME280 T&H I2C address:    0x76")
 # Load environment variables from .env
 # -----------------------------------------------------------------------------
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../config/.env'))
-
-# -----------------------------------------------------------------------------
-# Set up the Supabase client
-# Replace with your actual values or rely on environment variables.
-# -----------------------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SAMPLE_RATE  = int(os.getenv("SAMPLE_RATE", 60))
 
 # Initialize the Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
