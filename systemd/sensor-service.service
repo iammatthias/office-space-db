@@ -7,7 +7,7 @@ Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/office-space-db
-Environment="PYTHONPATH=/home/pi/office-space-db:/home/pi/office-space-db/config"
+Environment="PYTHONPATH=/home/pi/office-space-db/src:/home/pi/office-space-db"
 ExecStart=/home/pi/office-space-db/venv/bin/python3 /home/pi/office-space-db/src/sensor_service.py
 Restart=always
 RestartSec=5

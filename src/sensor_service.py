@@ -2,112 +2,86 @@
 # -*- coding:utf-8 -*-
 
 import sys
-print("Python interpreter:", sys.executable)
-print("sys.path:", sys.path)
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
-
 import time
 import smbus
 from datetime import datetime
-from dotenv import load_dotenv
-
-
-# Add the project root to PYTHONPATH
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
-
-# Supabase Python client
 from supabase import create_client, Client
-
-from python import ICM20948  # Gyroscope/Acceleration/Magnetometer
-from python import MPU925x   # Gyroscope/Acceleration/Magnetometer
-from python import BME280    # Atmospheric Pressure/Temperature/Humidity
-from python import LTR390    # UV
-from python import TSL2591   # Light
-from python import SGP40     # VOC
-
-# Import config module
+from python import ICM20948, MPU925x, BME280, LTR390, TSL2591, SGP40
 from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 
-# Optional display libraries (if needed)
-from PIL import Image, ImageDraw, ImageFont
-
-MPU_VAL_WIA       = 0x71
-MPU_ADD_WIA       = 0x75
-ICM_VAL_WIA       = 0xEA
-ICM_ADD_WIA       = 0x00
+# Constants for device IDs
+MPU_VAL_WIA = 0x71
+MPU_ADD_WIA = 0x75
+ICM_VAL_WIA = 0xEA
+ICM_ADD_WIA = 0x00
 ICM_SLAVE_ADDRESS = 0x68
 
+# I2C Bus
 bus = smbus.SMBus(1)
 
-# Initialize sensors
+# Initialize other sensors
 bme280 = BME280.BME280()
 bme280.get_calib_param()
 light = TSL2591.TSL2591()
-uv    = LTR390.LTR390()
-sgp   = SGP40.SGP40()
+uv = LTR390.LTR390()
+sgp = SGP40.SGP40()
 
-device_id1 = bus.read_byte_data(ICM_SLAVE_ADDRESS, ICM_ADD_WIA)
-device_id2 = bus.read_byte_data(ICM_SLAVE_ADDRESS, MPU_ADD_WIA)
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-if device_id1 == ICM_VAL_WIA:
-    mpu = ICM20948.ICM20948()
-    print("ICM20948 9-DOF I2C address: 0x68")
-elif device_id2 == MPU_VAL_WIA:
-    mpu = MPU925x.MPU925x()
-    print("MPU925x 9-DOF I2C address: 0x68")
+# Function to initialize MPU sensor
+def initialize_mpu():
+    try:
+        device_id1 = bus.read_byte_data(ICM_SLAVE_ADDRESS, ICM_ADD_WIA)
+        device_id2 = bus.read_byte_data(ICM_SLAVE_ADDRESS, MPU_ADD_WIA)
+        if device_id1 == ICM_VAL_WIA:
+            print("ICM20948 9-DOF I2C address: 0x68")
+            return ICM20948.ICM20948()
+        elif device_id2 == MPU_VAL_WIA:
+            print("MPU925x 9-DOF I2C address: 0x68")
+            return MPU925x.MPU925x()
+        else:
+            print("No supported MPU device found.")
+            return None
+    except Exception as e:
+        print(f"Error initializing MPU: {e}")
+        return None
+
+# Initialize MPU sensor
+mpu = initialize_mpu()
+if not mpu:
+    print("Failed to initialize MPU sensor. Exiting...")
+    sys.exit(1)
 
 print("TSL2591 Light I2C address: 0x29")
 print("LTR390 UV I2C address:     0x53")
 print("SGP40 VOC I2C address:     0x59")
 print("BME280 T&H I2C address:    0x76")
 
-# -----------------------------------------------------------------------------
-# Load environment variables from .env
-# -----------------------------------------------------------------------------
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../config/.env'))
-
-# Initialize the Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-print("Starting data collection... Press Ctrl+C to exit.")
-
+# Main data collection loop
 try:
     while True:
-        # Read from BME280
+        # Read sensor data
         bme = bme280.readData()
-        pressure = round(bme[0], 2)
-        temp     = round(bme[1], 2)
-        hum      = round(bme[2], 2)
+        pressure, temp, hum = round(bme[0], 2), round(bme[1], 2), round(bme[2], 2)
+        lux_val = round(light.Lux(), 2)
+        uvs = uv.UVS()
+        gas_val = round(sgp.raw(), 2)
+        icm = mpu.getdata()
 
-        # Read from TSL2591
-        lux_val  = round(light.Lux(), 2)
-
-        # Read from LTR390 (UV sensor)
-        uvs      = uv.UVS()
-
-        # Read from SGP40 (VOC sensor)
-        gas_val  = round(sgp.raw(), 2)
-
-        # Read from ICM/MPU
-        icm      = mpu.getdata()  # [roll, pitch, yaw, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z]
-
-        # Print out data
+        # Print sensor data
         print("=============================================")
-        print(f"pressure : {pressure} hPa")
-        print(f"temp     : {temp} ℃")
-        print(f"hum      : {hum} %")
-        print(f"lux      : {lux_val}")
-        print(f"uv       : {uvs}")
-        print(f"gas      : {gas_val}")
-        print(f"Roll     : {icm[0]:.2f}, Pitch: {icm[1]:.2f}, Yaw: {icm[2]:.2f}")
-        print(f"Accel    : X = {icm[3]}, Y = {icm[4]}, Z = {icm[5]}")
-        print(f"Gyro     : X = {icm[6]}, Y = {icm[7]}, Z = {icm[8]}")
-        print(f"Mag      : X = {icm[9]}, Y = {icm[10]}, Z = {icm[11]}")
+        print(f"pressure: {pressure} hPa, temp: {temp} ℃, hum: {hum} %")
+        print(f"lux: {lux_val}, uv: {uvs}, gas: {gas_val}")
+        print(f"Roll: {icm[0]:.2f}, Pitch: {icm[1]:.2f}, Yaw: {icm[2]:.2f}")
+        print(f"Accel: X = {icm[3]}, Y = {icm[4]}, Z = {icm[5]}")
+        print(f"Gyro: X = {icm[6]}, Y = {icm[7]}, Z = {icm[8]}")
+        print(f"Mag: X = {icm[9]}, Y = {icm[10]}, Z = {icm[11]}")
 
         # Insert data into Supabase
         data_to_insert = {
-           "time": datetime.utcnow().isoformat(),
+            "time": datetime.utcnow().isoformat(),
             "pressure": pressure,
             "temp": temp,
             "hum": hum,
@@ -125,12 +99,11 @@ try:
             "gyro_z": icm[8],
             "mag_x": icm[9],
             "mag_y": icm[10],
-            "mag_z": icm[11]
+            "mag_z": icm[11],
         }
-
         supabase.table("environmental_data").insert(data_to_insert).execute()
 
-        # Wait for the specified sample rate
+        # Wait for the next sample
         time.sleep(SAMPLE_RATE)
 
 except KeyboardInterrupt:
