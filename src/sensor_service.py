@@ -4,6 +4,7 @@
 import time
 import os
 import smbus
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Supabase Python client
@@ -62,9 +63,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SAMPLE_RATE  = int(os.getenv("SAMPLE_RATE", 60))
 
-print("SUPABASE_URL:", SUPABASE_URL)
-print("SUPABASE_KEY:", SUPABASE_KEY)
-
 # Initialize the Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -105,6 +103,7 @@ try:
 
         # Insert data into Supabase
         data_to_insert = {
+            "time": datetime.utcnow(),
             "pressure": pressure,
             "temp": temp,
             "hum": hum,
@@ -127,8 +126,8 @@ try:
 
         supabase.table("environmental_data").insert(data_to_insert).execute()
 
-        # Wait 60 seconds
-        time.sleep(60)
+        # Wait for the specified sample rate
+        time.sleep(SAMPLE_RATE)
 
 except KeyboardInterrupt:
     print("Exiting...")
