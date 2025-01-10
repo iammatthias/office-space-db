@@ -4,9 +4,8 @@
 import sys
 import os
 import time
-from datetime import datetime
 import smbus
-import subprocess
+from datetime import datetime
 from supabase import create_client, Client
 from python import ICM20948, MPU925x, BME280, LTR390, TSL2591, SGP40
 from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
@@ -15,22 +14,16 @@ from config.config import SUPABASE_URL, SUPABASE_KEY, SAMPLE_RATE
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Constants for I2C devices
-MPU_VAL_WIA = 0x71  # MPU925x ID
-MPU_ADD_WIA = 0x75  # MPU925x WHO_AM_I register
-ICM_VAL_WIA = 0xEA  # ICM20948 ID
-ICM_ADD_WIA = 0x00  # ICM20948 WHO_AM_I register
-ICM_SLAVE_ADDRESS = 0x68  # I2C address for both MPU925x and ICM20948
-
-# Other sensor I2C addresses
-TSL2591_I2C_ADDRESS = 0x29
-LTR390_I2C_ADDRESS = 0x53
-SGP40_I2C_ADDRESS = 0x59
-BME280_I2C_ADDRESS = 0x76
+ICM_SLAVE_ADDRESS = 0x68
+MPU_VAL_WIA = 0x71
+ICM_VAL_WIA = 0xEA
+MPU_ADD_WIA = 0x75
+ICM_ADD_WIA = 0x00
 
 # Initialize the I2C bus
 bus = smbus.SMBus(1)
 
-# Retry logic for sensor initialization
+# Helper function to initialize sensors with error handling
 def initialize_sensor(sensor_class, name):
     try:
         return sensor_class()
@@ -38,26 +31,32 @@ def initialize_sensor(sensor_class, name):
         print(f"Error initializing {name}: {e}")
         return None
 
-# Restart the Raspberry Pi
-def reboot_system():
-    print("Rebooting system due to sensor failure...")
-    subprocess.run(["sudo", "reboot"], check=True)
-
-# Initialize sensors with retry logic
+# Initialize sensors
 bme280 = initialize_sensor(BME280.BME280, "BME280")
+if bme280:
+    try:
+        bme280.get_calib_param()
+    except Exception as e:
+        print(f"Error calibrating BME280: {e}")
+        bme280 = None
+
 light = initialize_sensor(TSL2591.TSL2591, "TSL2591")
 uv = initialize_sensor(LTR390.LTR390, "LTR390")
 sgp = initialize_sensor(SGP40.SGP40, "SGP40")
 
 # Identify MPU/ICM device
 try:
-    time.sleep(0.1)  # Allow I2C bus to stabilize
+    time.sleep(0.1)
     device_id1 = bus.read_byte_data(ICM_SLAVE_ADDRESS, ICM_ADD_WIA)
     device_id2 = bus.read_byte_data(ICM_SLAVE_ADDRESS, MPU_ADD_WIA)
+    print(f"Detected IDs: device_id1=0x{device_id1:02X}, device_id2=0x{device_id2:02X}")
+
     if device_id1 == ICM_VAL_WIA:
         mpu = ICM20948.ICM20948()
+        print("ICM20948 detected.")
     elif device_id2 == MPU_VAL_WIA:
         mpu = MPU925x.MPU925x()
+        print("MPU925x detected.")
     else:
         print("No compatible MPU/ICM device found.")
         sys.exit(1)
@@ -65,85 +64,63 @@ except Exception as e:
     print(f"Error identifying MPU/ICM device: {e}")
     sys.exit(1)
 
-# Initialize failure counters
-sensor_failures = {
-    "BME280": 0,
-    "TSL2591": 0,
-    "LTR390": 0,
-    "SGP40": 0,
-    "ICM": 0
-}
+print("Starting data collection... Press Ctrl+C to exit.")
 
-MAX_FAILURES = 5  # Threshold for triggering a reboot
-
-# Data collection loop
 try:
     while True:
+        # Default sensor readings
+        pressure, temp, hum = None, None, None
+        lux_val, uvs, gas_val = None, None, None
+        icm = [None] * 12
+
         try:
-            # Read from BME280
             if bme280:
                 bme = bme280.readData()
-                if len(bme) == 3:  # Ensure the returned data has all three elements
-                    pressure = round(bme[0], 2)
-                    temp = round(bme[1], 2)
-                    hum = round(bme[2], 2)
+                if len(bme) == 3:  # Ensure valid data length
+                    pressure, temp, hum = map(lambda x: round(x, 2), bme)
                 else:
-                    raise ValueError("Incomplete data returned by BME280.")
-                sensor_failures["BME280"] = 0
-            else:
-                pressure, temp, hum = None, None, None
+                    raise ValueError("Incomplete data from BME280.")
         except Exception as e:
             print(f"Error reading BME280: {e}")
-            sensor_failures["BME280"] += 1
-            if sensor_failures["BME280"] >= MAX_FAILURES:
-                reboot_system()
-            pressure, temp, hum = None, None, None
 
         try:
-            # Read from TSL2591
-            lux_val = round(light.Lux(), 2) if light else None
-            sensor_failures["TSL2591"] = 0
+            if light:
+                lux_val = round(light.Lux(), 2)
         except Exception as e:
             print(f"Error reading TSL2591: {e}")
-            sensor_failures["TSL2591"] += 1
-            if sensor_failures["TSL2591"] >= MAX_FAILURES:
-                reboot_system()
-            lux_val = None
 
         try:
-            # Read from LTR390 (UV sensor)
-            uvs = float(uv.UVS()) if uv else None
-            sensor_failures["LTR390"] = 0
+            if uv:
+                uvs = float(uv.UVS())
         except Exception as e:
             print(f"Error reading LTR390: {e}")
-            sensor_failures["LTR390"] += 1
-            if sensor_failures["LTR390"] >= MAX_FAILURES:
-                reboot_system()
-            uvs = None
 
         try:
-            # Read from SGP40 (VOC sensor)
-            gas_val = round(float(sgp.raw()), 2) if sgp else None
-            sensor_failures["SGP40"] = 0
+            if sgp:
+                gas_val = round(float(sgp.raw()), 2)
         except Exception as e:
             print(f"Error reading SGP40: {e}")
-            sensor_failures["SGP40"] += 1
-            if sensor_failures["SGP40"] >= MAX_FAILURES:
-                reboot_system()
-            gas_val = None
 
         try:
-            # Read from ICM/MPU
-            icm = mpu.getdata() if mpu else [None] * 12
-            sensor_failures["ICM"] = 0
+            if mpu:
+                icm = mpu.getdata()
         except Exception as e:
             print(f"Error reading MPU/ICM: {e}")
-            sensor_failures["ICM"] += 1
-            if sensor_failures["ICM"] >= MAX_FAILURES:
-                reboot_system()
-            icm = [None] * 12
 
-        # Prepare data for insertion
+        # Print sensor readings
+        print("=============================================")
+        print(f"pressure : {pressure} hPa")
+        print(f"temp     : {temp} ℃")
+        print(f"hum      : {hum} %")
+        print(f"lux      : {lux_val}")
+        print(f"uv       : {uvs}")
+        print(f"gas      : {gas_val}")
+        print(f"Roll     : {icm[0]}, Pitch: {icm[1]}, Yaw: {icm[2]}")
+        print(f"Accel    : X = {icm[3]}, Y = {icm[4]}, Z = {icm[5]}")
+        print(f"Gyro     : X = {icm[6]}, Y = {icm[7]}, Z = {icm[8]}")
+        print(f"Mag      : X = {icm[9]}, Y = {icm[10]}, Z = {icm[11]}")
+
+        # Insert data into Supabase
         data_to_insert = {
             "time": datetime.utcnow().isoformat(),
             "pressure": pressure,
@@ -171,6 +148,7 @@ try:
         except Exception as e:
             print(f"Error inserting data into Supabase: {e}")
 
+        # Sleep for the sample rate interval
         time.sleep(SAMPLE_RATE)
 
 except KeyboardInterrupt:
