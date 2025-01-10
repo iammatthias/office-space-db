@@ -80,16 +80,27 @@ MAX_FAILURES = 5  # Threshold for triggering a reboot
 try:
     while True:
         try:
-            bme = bme280.readData() if bme280 else [None, None, None]
-            pressure, temp, hum = round(bme[0], 2), round(bme[1], 2), round(bme[2], 2)
-            sensor_failures["BME280"] = 0
+            # Read from BME280
+            if bme280:
+                bme = bme280.readData()
+                if len(bme) == 3:  # Ensure the returned data has all three elements
+                    pressure = round(bme[0], 2)
+                    temp = round(bme[1], 2)
+                    hum = round(bme[2], 2)
+                else:
+                    raise ValueError("Incomplete data returned by BME280.")
+                sensor_failures["BME280"] = 0
+            else:
+                pressure, temp, hum = None, None, None
         except Exception as e:
             print(f"Error reading BME280: {e}")
             sensor_failures["BME280"] += 1
             if sensor_failures["BME280"] >= MAX_FAILURES:
                 reboot_system()
+            pressure, temp, hum = None, None, None
 
         try:
+            # Read from TSL2591
             lux_val = round(light.Lux(), 2) if light else None
             sensor_failures["TSL2591"] = 0
         except Exception as e:
@@ -97,8 +108,10 @@ try:
             sensor_failures["TSL2591"] += 1
             if sensor_failures["TSL2591"] >= MAX_FAILURES:
                 reboot_system()
+            lux_val = None
 
         try:
+            # Read from LTR390 (UV sensor)
             uvs = float(uv.UVS()) if uv else None
             sensor_failures["LTR390"] = 0
         except Exception as e:
@@ -106,8 +119,10 @@ try:
             sensor_failures["LTR390"] += 1
             if sensor_failures["LTR390"] >= MAX_FAILURES:
                 reboot_system()
+            uvs = None
 
         try:
+            # Read from SGP40 (VOC sensor)
             gas_val = round(float(sgp.raw()), 2) if sgp else None
             sensor_failures["SGP40"] = 0
         except Exception as e:
@@ -115,8 +130,10 @@ try:
             sensor_failures["SGP40"] += 1
             if sensor_failures["SGP40"] >= MAX_FAILURES:
                 reboot_system()
+            gas_val = None
 
         try:
+            # Read from ICM/MPU
             icm = mpu.getdata() if mpu else [None] * 12
             sensor_failures["ICM"] = 0
         except Exception as e:
@@ -124,6 +141,7 @@ try:
             sensor_failures["ICM"] += 1
             if sensor_failures["ICM"] >= MAX_FAILURES:
                 reboot_system()
+            icm = [None] * 12
 
         # Prepare data for insertion
         data_to_insert = {
