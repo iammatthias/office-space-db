@@ -1,3 +1,5 @@
+"""Service for generating and managing environmental data visualizations."""
+
 import asyncio
 from datetime import datetime, timezone, timedelta, time
 import os
@@ -48,26 +50,31 @@ class VisualizationService:
         logging.info(f"Output directory: {output_dir}")
         logging.info(f"Configured sensors: {sensors}")
 
-    def get_image_path(self, sensor: str, timestamp: datetime) -> Path:
+    def get_image_path(self, sensor: str, start_time: datetime, end_time: datetime) -> Path:
         """
         Generate file path for visualization.
-        Images are stored by year/month/day and include the timestamp
-        at minute resolution (1440px wide).
+        Images are stored by year/month/day and include the start and end timestamps
+        at minute resolution.
         """
-        pst_time = convert_to_pst(timestamp)
-        start_time = (pst_time - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_time = start_time + timedelta(days=1)
+        start_pst = convert_to_pst(start_time)
+        end_pst = convert_to_pst(end_time)
         
-        # Create nested directory structure
-        image_dir = self.output_dir / sensor / str(start_time.year) / f"{start_time.month:02d}"
+        # Create nested directory structure based on start time
+        image_dir = self.output_dir / sensor / str(start_pst.year) / f"{start_pst.month:02d}"
         image_dir.mkdir(parents=True, exist_ok=True)
         
         # Generate filename with start and end timestamps
-        filename = f"{start_time.strftime('%Y%m%d_%H%M')}-{end_time.strftime('%Y%m%d_%H%M')}.png"
+        filename = f"{start_pst.strftime('%Y%m%d_%H%M')}-{end_pst.strftime('%Y%m%d_%H%M')}.png"
         
         return image_dir / filename
 
-    async def process_sensor_update(self, sensor: Dict[str, str], start_date: datetime, end_date: datetime, sensor_status: Dict):
+    async def process_sensor_update(
+        self,
+        sensor: Dict[str, str],
+        start_date: datetime,
+        end_date: datetime,
+        sensor_status: Dict
+    ):
         """Process update for a single sensor."""
         try:
             # Convert PST dates to UTC for database query
@@ -85,21 +92,64 @@ class VisualizationService:
                     data=data,
                     column=sensor['column'],
                     color_scheme=sensor['color_scheme'],
-                    start_time=start_date  # Keep PST for visualization
+                    start_time=start_date,  # Keep PST for visualization
+                    end_time=end_date
                 )
                 
                 # Save image to file
-                image_path = self.get_image_path(sensor['column'], end_date)
+                image_path = self.get_image_path(sensor['column'], start_date, end_date)
                 image.save(image_path)
                 
                 sensor_status[sensor['column']] = {
-                    'last_update': end_date.isoformat(),
+                    'start_time': start_date.isoformat(),
+                    'end_time': end_date.isoformat(),
                     'image_path': str(image_path)
                 }
                 
                 logger.info(f"Saved visualization for {sensor['column']} to {image_path}")
         except Exception as e:
             logger.error(f"Error updating {sensor['column']}: {str(e)}")
+            raise
+
+    async def generate_visualization(
+        self,
+        sensor: str,
+        start_time: datetime,
+        end_time: datetime,
+        color_scheme: str = 'base'
+    ) -> Optional[Path]:
+        """Generate a visualization for a specific time range."""
+        try:
+            # Convert to PST for visualization boundaries
+            start_pst = convert_to_pst(start_time)
+            end_pst = convert_to_pst(end_time)
+            
+            # Get data from service
+            data = await self.data_service.get_sensor_data(
+                sensor,
+                start_date=start_time.astimezone(timezone.utc),
+                end_date=end_time.astimezone(timezone.utc)
+            )
+            
+            if data:
+                image = self.generator.generate_visualization(
+                    data=data,
+                    column=sensor,
+                    color_scheme=color_scheme,
+                    start_time=start_pst,
+                    end_time=end_pst
+                )
+                
+                # Save and return image path
+                image_path = self.get_image_path(sensor, start_pst, end_pst)
+                image.save(image_path)
+                return image_path
+            
+            logger.warning(f"No data found for {sensor} between {start_time} and {end_time}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error generating visualization for {sensor}: {str(e)}")
             raise
 
     async def backfill(self):
@@ -193,11 +243,11 @@ async def start_service(
     
     sensors = [
         {'column': 'temperature', 'color_scheme': 'redblue'},
-        {'column': 'humidity', 'color_scheme': 'cyan'},
-        {'column': 'pressure', 'color_scheme': 'green'},
-        {'column': 'light', 'color_scheme': 'base'},
-        {'column': 'uv', 'color_scheme': 'purple'},
-        {'column': 'gas', 'color_scheme': 'green'}
+        # {'column': 'humidity', 'color_scheme': 'cyan'},
+        # {'column': 'pressure', 'color_scheme': 'green'},
+        # {'column': 'light', 'color_scheme': 'base'},
+        # {'column': 'uv', 'color_scheme': 'purple'},
+        # {'column': 'gas', 'color_scheme': 'green'}
     ]
     
     service = VisualizationService(

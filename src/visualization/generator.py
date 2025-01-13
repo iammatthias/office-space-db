@@ -24,7 +24,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 MINUTES_IN_DAY = 1440  # 1px per minute
-BASE_HEIGHT = 1825     # Fixed height for all visualizations
+BASE_HEIGHT = 1825     # Base height for single row
 SCALE_FACTOR = 4      # Default scale factor for final output
 
 COLOR_SCHEMES = {
@@ -96,102 +96,164 @@ class VisualizationGenerator:
     def __init__(self, scale_factor: int = 4):
         """Initialize the visualization generator."""
         self.width = MINUTES_IN_DAY  # 1440 minutes in a day
-        self.height = BASE_HEIGHT    # 1,825px high
         self.scale_factor = scale_factor
+
+    def _calculate_row_height(self, num_rows: int) -> int:
+        """Calculate row height based on number of rows."""
+        return math.floor(BASE_HEIGHT / num_rows)
+
+    def _get_row_and_minute(self, timestamp: datetime, start_time: datetime) -> Tuple[int, int]:
+        """Get row index and minute offset for a timestamp."""
+        pst_time = convert_to_pst(timestamp)
+        start_pst = convert_to_pst(start_time)
+        
+        # Calculate days since start (row index)
+        days_since_start = (pst_time.date() - start_pst.date()).days
+        
+        # Calculate minute within the day
+        minute = pst_time.hour * 60 + pst_time.minute
+        
+        return days_since_start, minute
 
     def generate_visualization(
         self,
         data: List[EnvironmentalData],
         column: str,
         color_scheme: str,
-        start_time: datetime
+        start_time: datetime,
+        end_time: Optional[datetime] = None
     ) -> Image:
         """Generate a visualization for a time period."""
-        # Ensure start_time is in PST and at midnight
+        # Ensure start_time is in PST
         start_time = convert_to_pst(start_time)
-        start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        if end_time is None:
+            # Default to end of the day if not specified
+            end_time = start_time + timedelta(days=1)
+        end_time = convert_to_pst(end_time)
         
-        # Create image with full dimensions
-        image = Image.new('RGB', (self.width, self.height))
+        # Calculate number of days (rows) needed
+        num_days = math.ceil((end_time - start_time).total_seconds() / (24 * 3600))
+        row_height = self._calculate_row_height(num_days)
+        total_height = row_height * num_days
+        
+        # Create image with calculated dimensions
+        image = Image.new('RGB', (self.width, total_height))
         pixels = image.load()
         
-        # Convert timestamps to PST and sort
-        pst_data = [(convert_to_pst(point.time), point.value) for point in data]
-        sorted_data = sorted(pst_data, key=lambda x: x[0])
-        
-        if not sorted_data:
-            logger.warning(f"No data points found for {column} at {start_time}")
+        if not data:
+            logger.warning(f"No data points found for {column} between {start_time} and {end_time}")
             return image.resize(
-                (self.width * self.scale_factor, self.height * self.scale_factor),
+                (self.width * self.scale_factor, total_height * self.scale_factor),
                 Image.NEAREST
             )
         
         # Get value range for normalization from all data
-        values = [value for _, value in sorted_data]
+        values = [point.value for point in data]
         min_value = min(values)
         max_value = max(values)
         
-        # Create minute map
-        minute_map = {}
-        for time, value in sorted_data:
-            minutes = int((time - start_time).total_seconds() / 60)
-            if 0 <= minutes < MINUTES_IN_DAY:
-                minute_map[minutes] = value
+        # Create minute map for each day and track closest values
+        day_minute_maps = {}
+        closest_values = {}  # Store closest values for each row
         
-        data_minutes = sorted(minute_map.keys())
-        if data_minutes:
-            first_data_minute = data_minutes[0]
-            last_data_minute = data_minutes[-1]
-            first_value = minute_map[first_data_minute]
-            last_value = minute_map[last_data_minute]
+        for point in data:
+            row, minute = self._get_row_and_minute(point.time, start_time)
+            if row not in day_minute_maps:
+                day_minute_maps[row] = {}
+            day_minute_maps[row][minute] = point.value
             
-            # Fill each minute
-            for minute in range(MINUTES_IN_DAY):
-                if minute in minute_map:
-                    value = minute_map[minute]
-                else:
-                    # Handle gaps differently based on position
-                    if minute < first_data_minute:
-                        # Before first data point, use first value
-                        value = first_value
-                    elif minute > last_data_minute:
-                        # After last data point, use last value
-                        value = last_value
-                    else:
-                        # Find nearest known values and interpolate
-                        before_value = None
-                        after_value = None
-                        before_minute = None
-                        after_minute = None
-                        
-                        # Find previous value
-                        for m in reversed(data_minutes):
-                            if m < minute:
-                                before_minute = m
-                                before_value = minute_map[m]
-                                break
-                        
-                        # Find next value
-                        for m in data_minutes:
-                            if m > minute:
-                                after_minute = m
-                                after_value = minute_map[m]
-                                break
-                        
-                        # Interpolate between known values
-                        range_size = after_minute - before_minute
-                        weight = (minute - before_minute) / range_size
-                        value = before_value + (after_value - before_value) * weight
-                
-                # Get color and set pixel
-                color = get_color_for(value, min_value, max_value, color_scheme)
-                
-                # Fill the entire column with the same color
-                for y in range(self.height):
-                    pixels[minute, y] = color
+            # Update closest values for the row
+            if row not in closest_values:
+                closest_values[row] = {'before': None, 'after': None}
+            closest_values[row]['after'] = point.value
+            
+            # Update 'before' value for next row if this is the last point of current row
+            if minute == MINUTES_IN_DAY - 1 and row + 1 < num_days:
+                if row + 1 not in closest_values:
+                    closest_values[row + 1] = {'before': None, 'after': None}
+                closest_values[row + 1]['before'] = point.value
         
+        # Fill pixels for each day
+        for row in range(num_days):
+            minute_map = day_minute_maps.get(row, {})
+            data_minutes = sorted(minute_map.keys()) if minute_map else []
+            
+            if data_minutes:
+                # Get the closest values for interpolation at row boundaries
+                row_closest = closest_values.get(row, {'before': None, 'after': None})
+                prev_row_last = closest_values.get(row - 1, {}).get('after') if row > 0 else None
+                next_row_first = closest_values.get(row + 1, {}).get('before') if row < num_days - 1 else None
+                
+                first_data_minute = data_minutes[0]
+                last_data_minute = data_minutes[-1]
+                first_value = minute_map[first_data_minute]
+                last_value = minute_map[last_data_minute]
+                
+                # Fill each minute in the row
+                for minute in range(MINUTES_IN_DAY):
+                    if minute in minute_map:
+                        value = minute_map[minute]
+                    else:
+                        # Handle gaps differently based on position
+                        if minute < first_data_minute:
+                            # Use closest value: either last value from previous row or first value in current row
+                            value = prev_row_last if prev_row_last is not None else first_value
+                        elif minute > last_data_minute:
+                            # Use closest value: either first value from next row or last value in current row
+                            value = next_row_first if next_row_first is not None else last_value
+                        else:
+                            # Find closest values for interpolation within the row
+                            before_value = None
+                            after_value = None
+                            before_minute = None
+                            after_minute = None
+                            
+                            # Find previous value
+                            for m in reversed(data_minutes):
+                                if m < minute:
+                                    before_minute = m
+                                    before_value = minute_map[m]
+                                    break
+                            
+                            # Find next value
+                            for m in data_minutes:
+                                if m > minute:
+                                    after_minute = m
+                                    after_value = minute_map[m]
+                                    break
+                            
+                            # Interpolate between closest known values
+                            if before_value is not None and after_value is not None:
+                                range_size = after_minute - before_minute
+                                weight = (minute - before_minute) / range_size
+                                value = before_value + (after_value - before_value) * weight
+                            else:
+                                # Use the closest available value
+                                value = before_value if before_value is not None else after_value
+                    
+                    # Get color and fill the column for this row
+                    if value is not None:
+                        color = get_color_for(value, min_value, max_value, color_scheme)
+                        row_start = row * row_height
+                        row_end = row_start + row_height
+                        for y in range(row_start, row_end):
+                            pixels[minute, y] = color
+            else:
+                # Handle completely empty rows by interpolating from surrounding rows
+                prev_row_value = closest_values.get(row - 1, {}).get('after') if row > 0 else None
+                next_row_value = closest_values.get(row + 1, {}).get('before') if row < num_days - 1 else None
+                
+                if prev_row_value is not None or next_row_value is not None:
+                    value = prev_row_value if prev_row_value is not None else next_row_value
+                    color = get_color_for(value, min_value, max_value, color_scheme)
+                    row_start = row * row_height
+                    row_end = row_start + row_height
+                    for minute in range(MINUTES_IN_DAY):
+                        for y in range(row_start, row_end):
+                            pixels[minute, y] = color
+            
         return image.resize(
-            (self.width * self.scale_factor, self.height * self.scale_factor),
+            (self.width * self.scale_factor, total_height * self.scale_factor),
             Image.NEAREST
         )
     
