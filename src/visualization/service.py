@@ -10,10 +10,10 @@ import logging
 import io
 from pathlib import Path
 
-from supabase.client import create_client, Client
 from .generator import VisualizationGenerator
 from .utils import EnvironmentalData, convert_to_pst
 from .data_service import DataService
+from .migrate_to_sqlite import migrate_data
 from config.config import (
     SUPABASE_URL,
     SUPABASE_KEY
@@ -32,14 +32,14 @@ class VisualizationService:
     def __init__(
         self,
         sensors: List[Dict[str, str]],
-        db_client: Client,
+        db_path: str = "data/environmental.db",
         output_dir: str = "data/visualizations",
         scale_factor: int = 4
     ):
         """Initialize the visualization service."""
         self.output_dir = Path(output_dir)
         self.sensors = sensors
-        self.data_service = DataService(db_client)
+        self.data_service = DataService(db_path)
         
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -49,35 +49,41 @@ class VisualizationService:
         
         logging.info(f"Output directory: {output_dir}")
         logging.info(f"Configured sensors: {sensors}")
-
-    def get_image_path(self, sensor: str, start_time: datetime, end_time: datetime) -> Path:
+        
+    def get_image_path(self, sensor: str, start_time: datetime, end_time: datetime, interval: str = 'daily') -> Path:
         """
         Generate file path for visualization.
-        Images are stored by year/month/day and include the start and end timestamps
-        at minute resolution.
+        Images are stored by interval (daily/hourly) using ISO format.
         """
-        start_pst = convert_to_pst(start_time)
-        end_pst = convert_to_pst(end_time)
+        # Ensure we're working with UTC times before converting to PST
+        start_utc = start_time.astimezone(timezone.utc)
         
-        # Create nested directory structure based on start time
-        image_dir = self.output_dir / sensor / str(start_pst.year) / f"{start_pst.month:02d}"
+        # Convert to PST for file organization
+        start_pst = convert_to_pst(start_utc)
+        
+        # Create directory structure based on interval
+        image_dir = self.output_dir / sensor / interval
         image_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate filename with start and end timestamps
-        filename = f"{start_pst.strftime('%Y%m%d_%H%M')}-{end_pst.strftime('%Y%m%d_%H%M')}.png"
+        # Generate filename with ISO format based on interval
+        if interval == 'hourly':
+            filename = f"{start_pst.strftime('%Y-%m-%dT%H')}.png"
+        else:  # daily
+            filename = f"{start_pst.date().isoformat()}.png"
         
         return image_dir / filename
-
+        
     async def process_sensor_update(
         self,
         sensor: Dict[str, str],
         start_date: datetime,
         end_date: datetime,
-        sensor_status: Dict
+        sensor_status: Dict,
+        interval: str = 'daily'
     ):
         """Process update for a single sensor."""
         try:
-            # Convert PST dates to UTC for database query
+            # Ensure we're working with UTC times for database query
             start_utc = start_date.astimezone(timezone.utc)
             end_utc = end_date.astimezone(timezone.utc)
             
@@ -88,29 +94,49 @@ class VisualizationService:
             )
             
             if data:
+                # Convert back to PST for visualization
+                start_pst = convert_to_pst(start_utc)
+                end_pst = convert_to_pst(end_utc)
+                
                 image = self.generator.generate_visualization(
                     data=data,
                     column=sensor['column'],
                     color_scheme=sensor['color_scheme'],
-                    start_time=start_date,  # Keep PST for visualization
-                    end_time=end_date
+                    start_time=start_pst,
+                    end_time=end_pst
                 )
                 
                 # Save image to file
-                image_path = self.get_image_path(sensor['column'], start_date, end_date)
+                image_path = self.get_image_path(sensor['column'], start_pst, end_pst, interval)
                 image.save(image_path)
                 
                 sensor_status[sensor['column']] = {
-                    'start_time': start_date.isoformat(),
-                    'end_time': end_date.isoformat(),
+                    'start_time': start_pst.isoformat(),
+                    'end_time': end_pst.isoformat(),
                     'image_path': str(image_path)
                 }
                 
-                logger.info(f"Saved visualization for {sensor['column']} to {image_path}")
+                logger.info(f"Saved {interval} visualization for {sensor['column']} to {image_path}")
         except Exception as e:
             logger.error(f"Error updating {sensor['column']}: {str(e)}")
             raise
-
+            
+    async def process_hourly_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict):
+        """Process hourly updates for all sensors."""
+        current = start_date
+        while current < end_date:
+            next_hour = current + timedelta(hours=1)
+            await asyncio.gather(
+                *(self.process_sensor_update(
+                    sensor,
+                    current,
+                    next_hour,
+                    sensor_status,
+                    'hourly'
+                ) for sensor in self.sensors)
+            )
+            current = next_hour
+            
     async def generate_visualization(
         self,
         sensor: str,
@@ -151,43 +177,52 @@ class VisualizationService:
         except Exception as e:
             logger.error(f"Error generating visualization for {sensor}: {str(e)}")
             raise
-
+            
     async def backfill(self):
         """Backfill visualizations from last stored image to current time."""
         logger.info("Starting backfill process")
-        current_time = datetime.now(timezone.utc)
-        current_time_pst = convert_to_pst(current_time)
         
+        # Get current time in UTC and convert to PST
+        now = datetime.now(timezone.utc)
+        now_pst = convert_to_pst(now)
+        today_midnight_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Get first data point
         first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
         if not first_data:
             logger.warning("No data found")
             return
             
-        # Ensure we start at midnight PST
-        first_point_time = convert_to_pst(first_data[0].time)
-        start_date = datetime.combine(
-            first_point_time.date(),
-            time.min,
-            tzinfo=ZoneInfo("America/Los_Angeles")
-        )
+        # Get first point time in PST and align to midnight
+        first_point_time = first_data[0].time  # Already in UTC from database
+        first_point_pst = convert_to_pst(first_point_time)
+        start_date = first_point_pst.replace(hour=0, minute=0, second=0, microsecond=0)
         
         sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
         
+        # Process each day
         current = start_date
-        while current < current_time_pst:
+        while current < today_midnight_pst:
             next_day = current + timedelta(days=1)
+            
+            # Generate daily visualization
             await asyncio.gather(
                 *(self.process_sensor_update(
                     sensor,
                     current,
                     next_day,
-                    sensor_status
+                    sensor_status,
+                    'daily'
                 ) for sensor in self.sensors)
             )
+            
+            # Generate hourly visualizations for this day
+            await self.process_hourly_updates(current, next_day, sensor_status)
+            
             current = next_day
             
         logger.info("Backfill complete")
-
+        
     async def run(self):
         """Run the visualization service."""
         logger.info("Starting visualization service...")
@@ -205,41 +240,52 @@ class VisualizationService:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
                 
-                # Wait until midnight PST
-                tomorrow_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                wait_seconds = (tomorrow_pst - now_pst).total_seconds()
+                # Calculate today's and tomorrow's midnight in PST
+                today_midnight_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
+                tomorrow_midnight_pst = today_midnight_pst + timedelta(days=1)
                 
+                # Wait until next midnight PST
+                wait_seconds = (tomorrow_midnight_pst - now_pst).total_seconds()
                 logger.info(f"Next update in {int(wait_seconds)} seconds")
                 await asyncio.sleep(wait_seconds)
                 
-                # Process the previous period (midnight to midnight PST)
-                start_time = tomorrow_pst - timedelta(days=1)  # Previous midnight PST
-                end_time = tomorrow_pst  # Next midnight PST
-                
+                # Process daily visualization
                 await asyncio.gather(
                     *(self.process_sensor_update(
                         sensor,
-                        start_time,
-                        end_time,
-                        sensor_status
+                        today_midnight_pst,
+                        tomorrow_midnight_pst,
+                        sensor_status,
+                        'daily'
                     ) for sensor in self.sensors)
                 )
+                
+                # Process hourly visualizations
+                await self.process_hourly_updates(today_midnight_pst, tomorrow_midnight_pst, sensor_status)
+                
             except Exception as e:
                 logger.error(f"Error in main loop: {str(e)}")
                 await asyncio.sleep(60)
 
 async def start_service(
-    supabase_url: str = SUPABASE_URL,
-    supabase_key: str = SUPABASE_KEY,
+    db_path: str = "data/environmental.db",
     output_dir: str = "data/visualizations",
     scale_factor: int = 4
 ):
     """Start the visualization service."""
     logging.info("Starting visualization service with configuration:")
-    logging.info(f"Supabase URL: {supabase_url}")
+    logging.info(f"Database path: {db_path}")
     logging.info(f"Output directory: {output_dir}")
     
-    db_client = create_client(supabase_url, supabase_key)
+    # Check if database exists and has data
+    db_file = Path(db_path)
+    if not db_file.exists() or db_file.stat().st_size < 1024:  # Less than 1KB is probably empty
+        logger.info("Database not found or empty. Running migration from Supabase...")
+        await migrate_data(
+            supabase_url=SUPABASE_URL,
+            supabase_key=SUPABASE_KEY,
+            db_path=db_path
+        )
     
     sensors = [
         {'column': 'temperature', 'color_scheme': 'redblue'},
@@ -252,7 +298,7 @@ async def start_service(
     
     service = VisualizationService(
         sensors=sensors,
-        db_client=db_client,
+        db_path=db_path,
         output_dir=output_dir,
         scale_factor=scale_factor
     )

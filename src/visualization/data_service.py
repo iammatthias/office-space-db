@@ -7,19 +7,19 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 import logging
 from zoneinfo import ZoneInfo
-from supabase.client import Client
 
 from .utils import EnvironmentalData, convert_to_pst
+from .sqlite_service import SQLiteService
 
 logger = logging.getLogger(__name__)
 
 class DataService:
     """Service for fetching and caching environmental sensor data."""
     
-    def __init__(self, db_client: Client, update_interval_minutes: int = 5):
+    def __init__(self, db_path: str = "data/environmental.db", update_interval_minutes: int = 5):
         """Initialize the data service."""
-        self.db_client = db_client
         self.update_interval = timedelta(minutes=update_interval_minutes)
+        self.sqlite_service = SQLiteService(db_path)
         self.column_map = {
             'temperature': 'temp',
             'humidity': 'hum',
@@ -39,6 +39,7 @@ class DataService:
     async def initialize(self):
         """Initialize the data service by fetching all historical data."""
         logger.info("Initializing data service...")
+        await self.sqlite_service.initialize()
         await self._fetch_all_historical_data()
         logger.info("Data service initialized")
         
@@ -48,59 +49,23 @@ class DataService:
     async def _fetch_all_historical_data(self):
         """Fetch all historical data from the database."""
         async with self._update_lock:
-            columns = ['time'] + list(self.column_map.values())
-            page_size = 1000  # Supabase's maximum limit
-            last_timestamp = None
             total_points = 0
             
-            while True:
-                query = self.db_client.table('environmental_data').select(','.join(columns))
-                if last_timestamp:
-                    query = query.gt('time', last_timestamp)
-                query = query.order('time', desc=False).limit(page_size)
+            # Fetch data for each sensor
+            for sensor in self.column_map.keys():
+                data = await self.sqlite_service.get_sensor_data(sensor)
+                self._data[sensor] = [(point.time, point.value) for point in data]
+                total_points += len(data)
                 
-                data = query.execute()
-                rows = data.data
-                if not rows:
-                    break
-                
-                # Process rows
-                for row in rows:
-                    try:
-                        timestamp = row['time'].replace('Z', '+00:00')
-                        dt = datetime.fromisoformat(timestamp)
-                        
-                        # Update last timestamp for pagination
-                        last_timestamp = dt
-                        
-                        # Update last timestamp for data tracking
-                        if self._last_timestamp is None or dt > self._last_timestamp:
-                            self._last_timestamp = dt
-                        
-                        # Process each sensor's value
-                        for sensor, db_column in self.column_map.items():
-                            value = row[db_column]
-                            if value is not None:
-                                try:
-                                    float_value = float(value)
-                                    self._data[sensor].append((dt, float_value))
-                                    total_points += 1
-                                except (ValueError, TypeError):
-                                    logger.warning(f"Invalid value for {db_column} at {dt}: {value}")
-                    except (ValueError, AttributeError) as e:
-                        logger.warning(f"Error parsing row timestamp: {e}")
-                        continue
-                
-                if len(rows) < page_size:
-                    break
-            
-            # Sort all data by timestamp
-            for sensor in self._data:
-                self._data[sensor].sort(key=lambda x: x[0])
+                # Update last timestamp
+                if data:
+                    last_time = data[-1].time
+                    if self._last_timestamp is None or last_time > self._last_timestamp:
+                        self._last_timestamp = last_time
             
             self._last_update = datetime.now(timezone.utc)
             logger.info(f"Fetched historical data: {total_points} total points across {len(self.column_map)} sensors")
-    
+            
     async def _fetch_new_data(self):
         """Fetch new data since last update."""
         if not self._last_timestamp:
@@ -108,43 +73,30 @@ class DataService:
             return
             
         async with self._update_lock:
-            columns = ['time'] + list(self.column_map.values())
-            query = self.db_client.table('environmental_data').select(','.join(columns))
-            query = query.gt('time', self._last_timestamp.isoformat())
-            query = query.order('time', desc=False)
-            
-            data = query.execute()
-            rows = data.data
-            
-            # Process new rows
             new_points = 0
-            for row in rows:
-                try:
-                    timestamp = row['time'].replace('Z', '+00:00')
-                    dt = datetime.fromisoformat(timestamp)
+            
+            # Fetch new data for each sensor
+            for sensor in self.column_map.keys():
+                data = await self.sqlite_service.get_sensor_data(
+                    sensor,
+                    start_date=self._last_timestamp
+                )
+                
+                if data:
+                    # Add new points to in-memory store
+                    new_data = [(point.time, point.value) for point in data]
+                    self._data[sensor].extend(new_data)
+                    new_points += len(data)
                     
                     # Update last timestamp
-                    if dt > self._last_timestamp:
-                        self._last_timestamp = dt
-                    
-                    # Process each sensor's value
-                    for sensor, db_column in self.column_map.items():
-                        value = row[db_column]
-                        if value is not None:
-                            try:
-                                float_value = float(value)
-                                self._data[sensor].append((dt, float_value))
-                                new_points += 1
-                            except (ValueError, TypeError):
-                                logger.warning(f"Invalid value for {db_column} at {dt}: {value}")
-                except (ValueError, AttributeError) as e:
-                    logger.warning(f"Error parsing row timestamp: {e}")
-                    continue
+                    last_time = data[-1].time
+                    if last_time > self._last_timestamp:
+                        self._last_timestamp = last_time
             
             self._last_update = datetime.now(timezone.utc)
             if new_points > 0:
                 logger.info(f"Fetched {new_points} new data points")
-    
+                
     async def _periodic_update(self):
         """Periodically update the data from the database."""
         while True:
@@ -154,7 +106,7 @@ class DataService:
             except Exception as e:
                 logger.error(f"Error updating data: {e}")
                 await asyncio.sleep(60)  # Wait a minute before retrying
-    
+                
     async def get_sensor_data(
         self,
         sensor: str,
@@ -190,7 +142,7 @@ class DataService:
             
             # Convert to EnvironmentalData objects
             parsed_data = [EnvironmentalData(dt, value) for dt, value in filtered_data]
-        
+            
         # Fill minute-by-minute data if date range provided
         if start_date and end_date and parsed_data:
             start_pst = convert_to_pst(start_date)
@@ -219,7 +171,7 @@ class DataService:
         
         logger.info(f"Retrieved {len(valid_data)} data points for {sensor}")
         return valid_data
-    
+        
     def _interpolate_missing_values(self, data: List[EnvironmentalData]) -> List[EnvironmentalData]:
         """Replace None values with linear interpolation based on nearest neighbors."""
         i = 0
