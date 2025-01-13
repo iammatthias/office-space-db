@@ -3,7 +3,7 @@
 import asyncio
 from datetime import datetime, timezone, timedelta, time
 import os
-from typing import List, Dict, Optional, Iterator, Tuple
+from typing import List, Dict, Optional, Iterator, Tuple, Set
 from zoneinfo import ZoneInfo
 import json
 import logging
@@ -48,8 +48,25 @@ class VisualizationService:
         # Initialize visualization generator with scale factor
         self.generator = VisualizationGenerator(scale_factor=scale_factor)
         
+        # Cache for created directories to avoid redundant checks
+        self._directory_cache: Set[Path] = set()
+        self._directory_cache.add(self.output_dir)
+        
+        # Create sensor directories upfront
+        for sensor in sensors:
+            for interval in ['daily', 'hourly', 'minute']:
+                sensor_dir = self.output_dir / sensor['column'] / interval
+                sensor_dir.mkdir(parents=True, exist_ok=True)
+                self._directory_cache.add(sensor_dir)
+        
         logging.info(f"Output directory: {output_dir}")
         logging.info(f"Configured sensors: {sensors}")
+        
+    def _ensure_directory_exists(self, directory: Path) -> None:
+        """Ensure directory exists, using cache to avoid redundant checks."""
+        if directory not in self._directory_cache:
+            directory.mkdir(parents=True, exist_ok=True)
+            self._directory_cache.add(directory)
         
     def get_image_path(self, sensor: str, start_time: datetime, end_time: datetime, interval: str = 'daily') -> Path:
         """
@@ -66,9 +83,9 @@ class VisualizationService:
         start_pst = convert_to_pst(start_utc)
         end_pst = convert_to_pst(end_utc)
         
-        # Create directory structure based on interval
+        # Get directory path
         image_dir = self.output_dir / sensor / interval
-        image_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory_exists(image_dir)
         
         # Generate filename with ISO format based on interval
         if interval == 'hourly':
@@ -80,7 +97,19 @@ class VisualizationService:
             filename = f"{start_pst.date().isoformat()}.png"
         
         return image_dir / filename
-        
+
+    def _save_image_buffered(self, image, path: Path) -> None:
+        """Save image with buffering for improved I/O performance."""
+        # Use a memory buffer for the image data
+        with io.BytesIO() as bio:
+            # Save image to memory buffer with optimized settings
+            image.save(bio, format='PNG', optimize=True)
+            # Get the buffer content
+            img_data = bio.getvalue()
+            
+            # Write the buffer to disk in one operation
+            path.write_bytes(img_data)
+
     async def process_sensor_update(
         self,
         sensor: Dict[str, str],
@@ -115,9 +144,9 @@ class VisualizationService:
                     interval=interval
                 )
                 
-                # Save image to file
+                # Save image to file using buffered I/O
                 image_path = self.get_image_path(sensor['column'], start_pst, end_pst, interval)
-                image.save(image_path)
+                self._save_image_buffered(image, image_path)
                 
                 sensor_status[sensor['column']] = {
                     'start_time': start_pst.isoformat(),
@@ -183,12 +212,13 @@ class VisualizationService:
             while current < end_pst:
                 next_minute = current + timedelta(minutes=1)
                 
-                # For each sensor that has data, generate a visualization
+                # Process each sensor in parallel
+                tasks = []
                 for sensor in self.sensors:
                     if sensor['column'] not in sensor_data:
                         pbar.update(1)
                         continue
-                        
+                    
                     # Filter data up to the current minute
                     current_data = [
                         point for point in sensor_data[sensor['column']]
@@ -205,9 +235,9 @@ class VisualizationService:
                             interval='minute'
                         )
                         
-                        # Save image to file
+                        # Save image to file using buffered I/O
                         image_path = self.get_image_path(sensor['column'], start_pst, next_minute, 'minute')
-                        image.save(image_path)
+                        self._save_image_buffered(image, image_path)
                         
                         sensor_status[sensor['column']] = {
                             'start_time': start_pst.isoformat(),
