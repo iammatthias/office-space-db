@@ -9,6 +9,7 @@ import json
 import logging
 import io
 from pathlib import Path
+from tqdm.asyncio import tqdm
 
 from .generator import VisualizationGenerator
 from .utils import EnvironmentalData, convert_to_pst
@@ -19,10 +20,10 @@ from config.config import (
     SUPABASE_KEY
 )
 
-# Set up logging
+# Set up simplified logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -124,18 +125,23 @@ class VisualizationService:
     async def process_hourly_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict):
         """Process hourly updates for all sensors."""
         current = start_date
-        while current < end_date:
-            next_hour = current + timedelta(hours=1)
-            await asyncio.gather(
-                *(self.process_sensor_update(
-                    sensor,
-                    current,
-                    next_hour,
-                    sensor_status,
-                    'hourly'
-                ) for sensor in self.sensors)
-            )
-            current = next_hour
+        total_hours = int((end_date - start_date).total_seconds() / 3600)
+        total_tasks = total_hours * len(self.sensors)
+        
+        with tqdm(total=total_tasks, desc="Generating hourly images") as pbar:
+            while current < end_date:
+                next_hour = current + timedelta(hours=1)
+                await asyncio.gather(
+                    *(self.process_sensor_update(
+                        sensor,
+                        current,
+                        next_hour,
+                        sensor_status,
+                        'hourly'
+                    ) for sensor in self.sensors)
+                )
+                pbar.update(len(self.sensors))
+                current = next_hour
             
     async def generate_visualization(
         self,
@@ -182,45 +188,48 @@ class VisualizationService:
         """Backfill visualizations from last stored image to current time."""
         logger.info("Starting backfill process")
         
-        # Get current time in UTC and convert to PST
         now = datetime.now(timezone.utc)
         now_pst = convert_to_pst(now)
         today_midnight_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Get first data point
         first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
         if not first_data:
             logger.warning("No data found")
             return
-            
-        # Get first point time in PST and align to midnight
-        first_point_time = first_data[0].time  # Already in UTC from database
+        
+        first_point_time = first_data[0].time
         first_point_pst = convert_to_pst(first_point_time)
         start_date = first_point_pst.replace(hour=0, minute=0, second=0, microsecond=0)
         
         sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
         
-        # Process each day
-        current = start_date
-        while current < today_midnight_pst:
-            next_day = current + timedelta(days=1)
-            
-            # Generate daily visualization
-            await asyncio.gather(
-                *(self.process_sensor_update(
-                    sensor,
-                    current,
-                    next_day,
-                    sensor_status,
-                    'daily'
-                ) for sensor in self.sensors)
-            )
-            
-            # Generate hourly visualizations for this day
-            await self.process_hourly_updates(current, next_day, sensor_status)
-            
-            current = next_day
-            
+        total_days = (today_midnight_pst - start_date).days
+        total_daily_tasks = total_days * len(self.sensors)
+        
+        logger.info(f"Processing {total_days} days of data for {len(self.sensors)} sensors")
+        
+        with tqdm(total=total_daily_tasks, desc="Generating daily images") as pbar:
+            current = start_date
+            while current < today_midnight_pst:
+                next_day = current + timedelta(days=1)
+                
+                # Generate daily visualization
+                await asyncio.gather(
+                    *(self.process_sensor_update(
+                        sensor,
+                        current,
+                        next_day,
+                        sensor_status,
+                        'daily'
+                    ) for sensor in self.sensors)
+                )
+                pbar.update(len(self.sensors))
+                
+                # Generate hourly visualizations for this day
+                await self.process_hourly_updates(current, next_day, sensor_status)
+                
+                current = next_day
+        
         logger.info("Backfill complete")
         
     async def run(self):
@@ -230,41 +239,42 @@ class VisualizationService:
         # Initial backfill
         await self.backfill()
         
-        logger.info("Starting updates")
+        logger.info("Starting continuous updates")
         
         sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
         
         while True:
             try:
-                # Always work in PST for visualization boundaries
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
                 
-                # Calculate today's and tomorrow's midnight in PST
                 today_midnight_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
                 tomorrow_midnight_pst = today_midnight_pst + timedelta(days=1)
                 
-                # Wait until next midnight PST
                 wait_seconds = (tomorrow_midnight_pst - now_pst).total_seconds()
-                logger.info(f"Next update in {int(wait_seconds)} seconds")
+                logger.info(f"Waiting {int(wait_seconds/3600)} hours until next update cycle")
                 await asyncio.sleep(wait_seconds)
                 
-                # Process daily visualization
-                await asyncio.gather(
-                    *(self.process_sensor_update(
-                        sensor,
-                        today_midnight_pst,
-                        tomorrow_midnight_pst,
-                        sensor_status,
-                        'daily'
-                    ) for sensor in self.sensors)
-                )
+                logger.info("Starting daily update cycle")
+                
+                # Process daily visualization with progress tracking
+                with tqdm(total=len(self.sensors), desc="Generating daily images") as pbar:
+                    await asyncio.gather(
+                        *(self.process_sensor_update(
+                            sensor,
+                            today_midnight_pst,
+                            tomorrow_midnight_pst,
+                            sensor_status,
+                            'daily'
+                        ) for sensor in self.sensors)
+                    )
+                    pbar.update(len(self.sensors))
                 
                 # Process hourly visualizations
                 await self.process_hourly_updates(today_midnight_pst, tomorrow_midnight_pst, sensor_status)
                 
             except Exception as e:
-                logger.error(f"Error in main loop: {str(e)}")
+                logger.error(f"Update cycle error: {str(e)}")
                 await asyncio.sleep(60)
 
 async def start_service(
@@ -289,7 +299,7 @@ async def start_service(
     
     sensors = [
         {'column': 'temperature', 'color_scheme': 'redblue'},
-        # {'column': 'humidity', 'color_scheme': 'cyan'},
+        {'column': 'humidity', 'color_scheme': 'cyan'},
         # {'column': 'pressure', 'color_scheme': 'green'},
         # {'column': 'light', 'color_scheme': 'base'},
         # {'column': 'uv', 'color_scheme': 'purple'},
