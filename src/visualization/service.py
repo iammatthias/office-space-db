@@ -576,11 +576,11 @@ async def start_service(
     
     sensors = [
         {'column': 'temperature', 'color_scheme': 'redblue'},
-        # {'column': 'humidity', 'color_scheme': 'cyan'},
-        # {'column': 'pressure', 'color_scheme': 'green'},
-        # {'column': 'light', 'color_scheme': 'base'},
-        # {'column': 'uv', 'color_scheme': 'purple'},
-        # {'column': 'gas', 'color_scheme': 'green'}
+        {'column': 'humidity', 'color_scheme': 'cyan'},
+        {'column': 'pressure', 'color_scheme': 'green'},
+        {'column': 'light', 'color_scheme': 'base'},
+        {'column': 'uv', 'color_scheme': 'purple'},
+        {'column': 'gas', 'color_scheme': 'green'}
     ]
     
     service = VisualizationService(
