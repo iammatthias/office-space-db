@@ -1,3 +1,8 @@
-supabase==2.0.0
-python-dotenv==1.0.0
-# Note: Waveshare sensor libraries are provided locally
+python-dotenv>=1.0.0
+supabase>=2.0.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+python-decouple>=3.8.0
+cloudflare>=2.8.15
+boto3>=1.26.0  # For R2 compatibility
+aioboto3>=11.0.0  # For async R2 operations

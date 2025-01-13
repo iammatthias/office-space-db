@@ -1,0 +1,396 @@
+"""
+Main visualization generator for environmental data.
+Matches the React/Three.js implementation exactly.
+"""
+
+import numpy as np
+from PIL import Image
+from typing import List, Optional, Tuple, Dict
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from .utils import (
+    EnvironmentalData,
+    organize_data_by_day,
+    get_range,
+    create_minute_map,
+    interpolate_value,
+    Range,
+    get_day_boundaries,
+    convert_to_pst
+)
+import math
+import logging
+
+logger = logging.getLogger(__name__)
+
+MINUTES_IN_DAY = 1440  # 1px per minute
+BASE_HEIGHT = 1825     # Fixed height for all visualizations
+SCALE_FACTOR = 4      # Default scale factor for final output
+
+COLOR_SCHEMES = {
+    'redblue': [
+        # Dark blue (cold) to light blue
+        "#163B66", "#1A4F8C", "#205EA6", "#3171B2", "#4385BE", "#66A0C8",
+        "#92BFDB", "#ABCFE2", "#C6DDE8", "#E1ECEB",
+        # Light red to dark red (hot)
+        "#FFE1D5", "#FFCABB", "#FDB2A2", "#F89A8A", "#E8705F", "#D14D41",
+        "#C03E35", "#AF3029", "#942822", "#6C201C"
+    ],
+    'cyan': [
+        "#101F1D", "#122F2C", "#143F3C", "#164F4A", "#1C6C66", "#24837B",
+        "#2F968D", "#3AA99F", "#5ABDAC", "#87D3C3", "#A2DECE", "#BFE8D9",
+        "#DDF1E4"
+    ],
+    'base': [
+        "#1C1B1A", "#282726", "#343331", "#403E3C", "#575653", "#6F6E69",
+        "#878580", "#9F9D96", "#B7B5AC", "#CECDC3", "#DAD8CE", "#E6E4D9",
+        "#F2F0E5"
+    ],
+    'purple': [
+        "#1A1623", "#1A1623", "#261C39", "#31234E", "#3C2A62", "#5E409D",
+        "#735EB5", "#8B7EC8", "#A699D0", "#C4B9E0", "#D3CAE6", "#E2D9E9",
+        "#F0EAEC"
+    ],
+    'green': [
+        "#1A1E0C", "#252D09", "#313D07", "#3D4C07", "#536907", "#668008",
+        "#768D21", "#879A39", "#A8AF54", "#BEC97E", "#CDD597", "#DDE2B2",
+        "#EDEECF"
+    ]
+}
+
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color string to RGB tuple."""
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def get_color_for(value: float, min_value: float, max_value: float, scheme: str) -> Tuple[int, int, int]:
+    """Get color for a value using the specified color scheme."""
+    # Normalize the value to a 0-1 scale
+    normalized = (value - min_value) / (max_value - min_value) if max_value > min_value else 0.5
+    normalized = min(max(normalized, 0.0), 1.0)
+    
+    # Get the appropriate color scheme based on the column type
+    colors = COLOR_SCHEMES.get(scheme.split('_')[0], COLOR_SCHEMES['redblue'])
+    
+    # Calculate the floating point index and interpolate between colors
+    float_index = normalized * (len(colors) - 1)
+    lower_index = int(float_index)
+    upper_index = min(lower_index + 1, len(colors) - 1)
+    
+    # Get the two colors to interpolate between
+    color1 = hex_to_rgb(colors[lower_index])
+    color2 = hex_to_rgb(colors[upper_index])
+    
+    # Calculate the interpolation weight
+    weight = float_index - lower_index
+    
+    # Interpolate between the two colors
+    return tuple(
+        int(c1 * (1 - weight) + c2 * weight)
+        for c1, c2 in zip(color1, color2)
+    )
+
+class VisualizationGenerator:
+    """Generator for environmental data visualizations."""
+    
+    def __init__(self, scale_factor: int = 4):
+        """Initialize the visualization generator."""
+        self.scale_factor = scale_factor
+        self.width = MINUTES_IN_DAY  # 1 pixel per minute
+        self.height = BASE_HEIGHT    # Fixed height for all visualizations
+        
+    def generate_daily_visualization(
+        self,
+        data: List[EnvironmentalData],
+        column: str,
+        color_scheme: str,
+        day_start: datetime
+    ) -> Image:
+        """Generate a single-row visualization for a 24-hour period."""
+        # Ensure day_start is in PST and at midnight
+        day_start = convert_to_pst(day_start)
+        day_start = day_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # First create a single row image
+        row_image = Image.new('RGB', (self.width, 1))
+        row_pixels = row_image.load()
+        
+        # Convert timestamps to PST and sort
+        pst_data = [(convert_to_pst(point.time), point.value) for point in data]
+        sorted_data = sorted(pst_data, key=lambda x: x[0])
+        
+        if not sorted_data:
+            logger.warning(f"No data points found for {column} on {day_start}")
+            return Image.new('RGB', (self.width * self.scale_factor, self.height * self.scale_factor))
+        
+        # Get value range for normalization from all data
+        values = [value for _, value in sorted_data]
+        min_value = min(values)
+        max_value = max(values)
+        
+        # Create minute map
+        minute_map = {}
+        for time, value in sorted_data:
+            minutes = int((time - day_start).total_seconds() / 60)
+            if 0 <= minutes < MINUTES_IN_DAY:
+                minute_map[minutes] = value
+        
+        # Find first and last minutes with data
+        data_minutes = sorted(minute_map.keys())
+        if data_minutes:
+            first_data_minute = data_minutes[0]
+            last_data_minute = data_minutes[-1]
+            first_value = minute_map[first_data_minute]
+            last_value = minute_map[last_data_minute]
+            
+            # Fill each minute
+            for minute in range(MINUTES_IN_DAY):
+                if minute in minute_map:
+                    value = minute_map[minute]
+                else:
+                    # Handle start/end of day gaps differently than mid-day nulls
+                    if minute < first_data_minute:
+                        # Before first data point, use first value
+                        value = first_value
+                    elif minute > last_data_minute:
+                        # After last data point, use last value
+                        value = last_value
+                    else:
+                        # Mid-day null - find nearest known values and interpolate
+                        before_value = None
+                        after_value = None
+                        before_minute = None
+                        after_minute = None
+                        
+                        # Find previous value
+                        for m in reversed(data_minutes):
+                            if m < minute:
+                                before_minute = m
+                                before_value = minute_map[m]
+                                break
+                        
+                        # Find next value
+                        for m in data_minutes:
+                            if m > minute:
+                                after_minute = m
+                                after_value = minute_map[m]
+                                break
+                        
+                        # Interpolate between known values
+                        range_size = after_minute - before_minute
+                        weight = (minute - before_minute) / range_size
+                        value = before_value + (after_value - before_value) * weight
+                
+                # Get color and set pixel
+                color = get_color_for(value, min_value, max_value, color_scheme)
+                row_pixels[minute, 0] = color
+        
+        # Create final image and stretch the row
+        image = Image.new('RGB', (self.width, self.height))
+        pixels = image.load()
+        
+        # Copy the row data to each row
+        for y in range(self.height):
+            for x in range(self.width):
+                pixels[x, y] = row_pixels[x, 0]
+        
+        return image.resize(
+            (self.width * self.scale_factor, self.height * self.scale_factor),
+            Image.NEAREST
+        )
+    
+    def generate_incremental_visualization(
+        self,
+        data: List[EnvironmentalData],
+        column: str,
+        color_scheme: str,
+        year: int
+    ) -> Image:
+        """Generate a visualization that grows incrementally throughout the year."""
+        # Create image with fixed dimensions
+        image = Image.new('RGB', (self.width, self.height))
+        pixels = image.load()
+        
+        if not data:
+            logger.warning(f"No data points found for {column} in {year}")
+            return image.resize(
+                (self.width * self.scale_factor, self.height * self.scale_factor),
+                Image.NEAREST
+            )
+        
+        # Convert timestamps to PST and organize by day
+        year_start = datetime(year, 1, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
+        pst_data = [(convert_to_pst(point.time), point.value) for point in data]
+        
+        # Get value range for normalization from all data
+        values = [value for _, value in pst_data]
+        min_value = min(values)
+        max_value = max(values)
+        
+        # Organize data by day
+        days = {}
+        for time, value in pst_data:
+            day_key = (time - year_start).days
+            if 0 <= day_key < 365:  # Only include days within the year
+                if day_key not in days:
+                    days[day_key] = []
+                days[day_key].append((time, value))
+        
+        # Calculate row height
+        num_days = min(len(days), 365)  # Use actual number of days, max 365
+        row_height = self.height / num_days
+        
+        # Process each day (in reverse order to put oldest data at top)
+        for day in range(num_days):
+            # Calculate actual row position (invert the day index)
+            inverted_day = num_days - 1 - day
+            day_start = year_start + timedelta(days=day)
+            day_data = days.get(day, [])
+            
+            # Create minute map for this day
+            minute_map = {}
+            for time, value in sorted(day_data, key=lambda x: x[0]):
+                minutes = int((time - day_start).total_seconds() / 60)
+                if 0 <= minutes < MINUTES_IN_DAY:
+                    minute_map[minutes] = value
+            
+            # Calculate row boundaries
+            row_start = int(inverted_day * row_height)
+            row_end = int((inverted_day + 1) * row_height)
+            
+            # Find first and last minutes with data
+            data_minutes = sorted(minute_map.keys())
+            if data_minutes:
+                first_minute = data_minutes[0]
+                last_minute = data_minutes[-1]
+                
+                # Fill each minute in the row
+                for minute in range(MINUTES_IN_DAY):
+                    if minute in minute_map:
+                        value = minute_map[minute]
+                    else:
+                        # Find nearest known values before and after current minute
+                        before_minute = minute - 1
+                        after_minute = minute + 1
+                        before_value = None
+                        after_value = None
+                        
+                        # Find previous value
+                        while before_minute >= first_minute:
+                            if before_minute in minute_map:
+                                before_value = minute_map[before_minute]
+                                break
+                            before_minute -= 1
+                        
+                        # Find next value
+                        while after_minute <= last_minute:
+                            if after_minute in minute_map:
+                                after_value = minute_map[after_minute]
+                                break
+                            after_minute += 1
+                        
+                        # Interpolate or use nearest value
+                        if before_value is not None and after_value is not None:
+                            # Interpolate between known values
+                            range_size = after_minute - before_minute
+                            weight = (minute - before_minute) / range_size
+                            value = before_value + (after_value - before_value) * weight
+                        elif before_value is not None:
+                            value = before_value
+                        elif after_value is not None:
+                            value = after_value
+                        else:
+                            value = (min_value + max_value) / 2
+                    
+                    # Get color and fill the column in this row
+                    color = get_color_for(value, min_value, max_value, color_scheme)
+                    for y in range(row_start, row_end):
+                        pixels[minute, y] = color
+            else:
+                # No data for this day, fill with average value
+                value = (min_value + max_value) / 2
+                color = get_color_for(value, min_value, max_value, color_scheme)
+                for x in range(MINUTES_IN_DAY):
+                    for y in range(row_start, row_end):
+                        pixels[x, y] = color
+        
+        return image.resize(
+            (self.width * self.scale_factor, self.height * self.scale_factor),
+            Image.NEAREST
+        )
+    
+    def _get_color(self, value: float, column: str, scheme: str) -> Tuple[int, int, int]:
+        """Get the color for a value based on the column type and color scheme."""
+        if column == 'temperature':
+            # Temperature: 10°C to 30°C (typical indoor range)
+            # Dark blue (cold) to Dark red (hot)
+            # We want light colors in the middle (around 20°C)
+            normalized = (value - 10) / 20  # Normalize from 10-30 range
+            normalized = min(max(normalized, 0.0), 1.0)
+            
+            if normalized < 0.5:
+                # Cold: Scale from dark blue to white
+                t = normalized * 2
+                return (
+                    int(255 * t),          # Red (0 -> 255)
+                    int(255 * t),          # Green (0 -> 255)
+                    255                     # Blue (always 255)
+                )
+            else:
+                # Hot: Scale from white to dark red
+                t = (normalized - 0.5) * 2
+                return (
+                    255,                    # Red (always 255)
+                    int(255 * (1 - t)),     # Green (255 -> 0)
+                    int(255 * (1 - t))      # Blue (255 -> 0)
+                )
+            
+        elif column == 'humidity':
+            # Humidity: 0% to 100%
+            # White (dry) to Cyan (humid)
+            normalized = value / 100
+            normalized = min(max(normalized, 0.0), 1.0)
+            return (
+                int(255 * (1 - normalized)), # Red
+                255,                         # Green
+                255                          # Blue
+            )
+            
+        elif column == 'pressure':
+            # Pressure: 980 to 1020 hPa
+            # Dark green (low) to bright green (high)
+            normalized = (value - 980) / 40  # Normalize from 980-1020 range
+            normalized = min(max(normalized, 0.0), 1.0)
+            intensity = int(255 * normalized)
+            return (0, intensity, 0)
+            
+        elif column == 'light':
+            # Light: 0 to 100000 lux (logarithmic scale)
+            # Black (dark) to White (bright)
+            if value <= 0:
+                normalized = 0
+            else:
+                normalized = min(math.log10(value) / 5.0, 1.0)  # log10(100000) ≈ 5
+            intensity = int(255 * normalized)
+            return (intensity, intensity, intensity)
+            
+        elif column == 'uv':
+            # UV: 0 to 11+ (UV index)
+            # Dark purple (low) to bright purple (high)
+            normalized = min(value / 11, 1.0)  # UV index goes from 0-11+
+            intensity = int(255 * normalized)
+            return (intensity, 0, intensity)
+            
+        elif column == 'gas':
+            # Gas: 0 to 100 (relative)
+            # Dark green (good) to bright green (poor)
+            normalized = value / 100
+            normalized = min(max(normalized, 0.0), 1.0)
+            intensity = int(255 * normalized)
+            return (0, intensity, 0)
+            
+        else:
+            # Default grayscale for unknown sensors
+            normalized = min(max(value / 100.0, 0.0), 1.0)
+            intensity = int(255 * normalized)
+            return (intensity, intensity, intensity) 
