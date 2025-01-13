@@ -95,10 +95,10 @@ class VisualizationGenerator:
     
     def __init__(self, scale_factor: int = 4):
         """Initialize the visualization generator."""
+        self.width = MINUTES_IN_DAY  # 1440 minutes in a day
+        self.height = BASE_HEIGHT    # 1,825px high
         self.scale_factor = scale_factor
-        self.width = MINUTES_IN_DAY  # 1 pixel per minute
-        self.height = BASE_HEIGHT    # Fixed height for all visualizations
-        
+
     def generate_daily_visualization(
         self,
         data: List[EnvironmentalData],
@@ -111,9 +111,12 @@ class VisualizationGenerator:
         day_start = convert_to_pst(day_start)
         day_start = day_start.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # First create a single row image
-        row_image = Image.new('RGB', (self.width, 1))
-        row_pixels = row_image.load()
+        # Calculate row height for a single day
+        row_height = self.height  # For daily visualization, use full height
+        
+        # Create image with full dimensions
+        image = Image.new('RGB', (self.width, self.height))
+        pixels = image.load()
         
         # Convert timestamps to PST and sort
         pst_data = [(convert_to_pst(point.time), point.value) for point in data]
@@ -121,7 +124,10 @@ class VisualizationGenerator:
         
         if not sorted_data:
             logger.warning(f"No data points found for {column} on {day_start}")
-            return Image.new('RGB', (self.width * self.scale_factor, self.height * self.scale_factor))
+            return image.resize(
+                (self.width * self.scale_factor, self.height * self.scale_factor),
+                Image.NEAREST
+            )
         
         # Get value range for normalization from all data
         values = [value for _, value in sorted_data]
@@ -135,7 +141,6 @@ class VisualizationGenerator:
             if 0 <= minutes < MINUTES_IN_DAY:
                 minute_map[minutes] = value
         
-        # Find first and last minutes with data
         data_minutes = sorted(minute_map.keys())
         if data_minutes:
             first_data_minute = data_minutes[0]
@@ -183,136 +188,10 @@ class VisualizationGenerator:
                 
                 # Get color and set pixel
                 color = get_color_for(value, min_value, max_value, color_scheme)
-                row_pixels[minute, 0] = color
-        
-        # Create final image and stretch the row
-        image = Image.new('RGB', (self.width, self.height))
-        pixels = image.load()
-        
-        # Copy the row data to each row
-        for y in range(self.height):
-            for x in range(self.width):
-                pixels[x, y] = row_pixels[x, 0]
-        
-        return image.resize(
-            (self.width * self.scale_factor, self.height * self.scale_factor),
-            Image.NEAREST
-        )
-    
-    def generate_incremental_visualization(
-        self,
-        data: List[EnvironmentalData],
-        column: str,
-        color_scheme: str,
-        year: int
-    ) -> Image:
-        """Generate a visualization that grows incrementally throughout the year."""
-        # Create image with fixed dimensions
-        image = Image.new('RGB', (self.width, self.height))
-        pixels = image.load()
-        
-        if not data:
-            logger.warning(f"No data points found for {column} in {year}")
-            return image.resize(
-                (self.width * self.scale_factor, self.height * self.scale_factor),
-                Image.NEAREST
-            )
-        
-        # Convert timestamps to PST and organize by day
-        year_start = datetime(year, 1, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
-        pst_data = [(convert_to_pst(point.time), point.value) for point in data]
-        
-        # Get value range for normalization from all data
-        values = [value for _, value in pst_data]
-        min_value = min(values)
-        max_value = max(values)
-        
-        # Organize data by day
-        days = {}
-        for time, value in pst_data:
-            day_key = (time - year_start).days
-            if 0 <= day_key < 365:  # Only include days within the year
-                if day_key not in days:
-                    days[day_key] = []
-                days[day_key].append((time, value))
-        
-        # Calculate row height
-        num_days = min(len(days), 365)  # Use actual number of days, max 365
-        row_height = self.height / num_days
-        
-        # Process each day (in reverse order to put oldest data at top)
-        for day in range(num_days):
-            # Calculate actual row position (invert the day index)
-            inverted_day = num_days - 1 - day
-            day_start = year_start + timedelta(days=day)
-            day_data = days.get(day, [])
-            
-            # Create minute map for this day
-            minute_map = {}
-            for time, value in sorted(day_data, key=lambda x: x[0]):
-                minutes = int((time - day_start).total_seconds() / 60)
-                if 0 <= minutes < MINUTES_IN_DAY:
-                    minute_map[minutes] = value
-            
-            # Calculate row boundaries
-            row_start = int(inverted_day * row_height)
-            row_end = int((inverted_day + 1) * row_height)
-            
-            # Find first and last minutes with data
-            data_minutes = sorted(minute_map.keys())
-            if data_minutes:
-                first_minute = data_minutes[0]
-                last_minute = data_minutes[-1]
                 
-                # Fill each minute in the row
-                for minute in range(MINUTES_IN_DAY):
-                    if minute in minute_map:
-                        value = minute_map[minute]
-                    else:
-                        # Find nearest known values before and after current minute
-                        before_minute = minute - 1
-                        after_minute = minute + 1
-                        before_value = None
-                        after_value = None
-                        
-                        # Find previous value
-                        while before_minute >= first_minute:
-                            if before_minute in minute_map:
-                                before_value = minute_map[before_minute]
-                                break
-                            before_minute -= 1
-                        
-                        # Find next value
-                        while after_minute <= last_minute:
-                            if after_minute in minute_map:
-                                after_value = minute_map[after_minute]
-                                break
-                            after_minute += 1
-                        
-                        # Interpolate or use nearest value
-                        if before_value is not None and after_value is not None:
-                            # Interpolate between known values
-                            range_size = after_minute - before_minute
-                            weight = (minute - before_minute) / range_size
-                            value = before_value + (after_value - before_value) * weight
-                        elif before_value is not None:
-                            value = before_value
-                        elif after_value is not None:
-                            value = after_value
-                        else:
-                            value = (min_value + max_value) / 2
-                    
-                    # Get color and fill the column in this row
-                    color = get_color_for(value, min_value, max_value, color_scheme)
-                    for y in range(row_start, row_end):
-                        pixels[minute, y] = color
-            else:
-                # No data for this day, fill with average value
-                value = (min_value + max_value) / 2
-                color = get_color_for(value, min_value, max_value, color_scheme)
-                for x in range(MINUTES_IN_DAY):
-                    for y in range(row_start, row_end):
-                        pixels[x, y] = color
+                # Fill the entire column with the same color
+                for y in range(self.height):
+                    pixels[minute, y] = color
         
         return image.resize(
             (self.width * self.scale_factor, self.height * self.scale_factor),
