@@ -6,7 +6,7 @@ Matches the React/Three.js implementation exactly.
 import numpy as np
 from PIL import Image
 from typing import List, Optional, Tuple, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from .utils import (
     EnvironmentalData,
@@ -100,7 +100,9 @@ class VisualizationGenerator:
 
     def _calculate_row_height(self, num_rows: int) -> int:
         """Calculate row height based on number of rows."""
-        return math.floor(BASE_HEIGHT / num_rows)
+        # For minute-based visualizations, we want to ensure the row height
+        # scales appropriately with the number of rows
+        return max(1, math.floor(BASE_HEIGHT / num_rows))
 
     def _get_row_and_minute(self, timestamp: datetime, start_time: datetime) -> Tuple[int, int]:
         """Get row index and minute offset for a timestamp."""
@@ -121,7 +123,8 @@ class VisualizationGenerator:
         column: str,
         color_scheme: str,
         start_time: datetime,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        interval: str = 'daily'
     ) -> Image:
         """Generate a visualization for a time period."""
         # Ensure start_time is in PST
@@ -131,10 +134,16 @@ class VisualizationGenerator:
             end_time = start_time + timedelta(days=1)
         end_time = convert_to_pst(end_time)
         
-        # Calculate number of days (rows) needed
-        num_days = math.ceil((end_time - start_time).total_seconds() / (24 * 3600))
-        row_height = self._calculate_row_height(num_days)
-        total_height = row_height * num_days
+        # Calculate number of days needed (partial days count as full days)
+        # Get the start and end dates in PST, as we always want to align to PST midnight boundaries
+        start_date = start_time.date()
+        end_date = end_time.date()
+        if end_time.time() > time(0, 0):  # If end time is not midnight, we need one more day
+            end_date += timedelta(days=1)
+        num_rows = (end_date - start_date).days
+        
+        row_height = self._calculate_row_height(num_rows)
+        total_height = row_height * num_rows
         
         # Create image with calculated dimensions
         image = Image.new('RGB', (self.width, total_height))
@@ -157,7 +166,13 @@ class VisualizationGenerator:
         closest_values = {}  # Store closest values for each row
         
         for point in data:
-            row, minute = self._get_row_and_minute(point.time, start_time)
+            # Convert point time to PST and get its position
+            point_time = convert_to_pst(point.time)
+            # Calculate row based on days since start
+            row = (point_time.date() - start_date).days
+            # Calculate minute within the day (0-1439)
+            minute = point_time.hour * 60 + point_time.minute
+            
             if row not in day_minute_maps:
                 day_minute_maps[row] = {}
             day_minute_maps[row][minute] = point.value
@@ -168,13 +183,13 @@ class VisualizationGenerator:
             closest_values[row]['after'] = point.value
             
             # Update 'before' value for next row if this is the last point of current row
-            if minute == MINUTES_IN_DAY - 1 and row + 1 < num_days:
+            if minute == MINUTES_IN_DAY - 1 and row + 1 < num_rows:
                 if row + 1 not in closest_values:
                     closest_values[row + 1] = {'before': None, 'after': None}
                 closest_values[row + 1]['before'] = point.value
         
         # Fill pixels for each day
-        for row in range(num_days):
+        for row in range(num_rows):
             minute_map = day_minute_maps.get(row, {})
             data_minutes = sorted(minute_map.keys()) if minute_map else []
             
@@ -182,7 +197,7 @@ class VisualizationGenerator:
                 # Get the closest values for interpolation at row boundaries
                 row_closest = closest_values.get(row, {'before': None, 'after': None})
                 prev_row_last = closest_values.get(row - 1, {}).get('after') if row > 0 else None
-                next_row_first = closest_values.get(row + 1, {}).get('before') if row < num_days - 1 else None
+                next_row_first = closest_values.get(row + 1, {}).get('before') if row < num_rows - 1 else None
                 
                 first_data_minute = data_minutes[0]
                 last_data_minute = data_minutes[-1]
@@ -241,7 +256,7 @@ class VisualizationGenerator:
             else:
                 # Handle completely empty rows by interpolating from surrounding rows
                 prev_row_value = closest_values.get(row - 1, {}).get('after') if row > 0 else None
-                next_row_value = closest_values.get(row + 1, {}).get('before') if row < num_days - 1 else None
+                next_row_value = closest_values.get(row + 1, {}).get('before') if row < num_rows - 1 else None
                 
                 if prev_row_value is not None or next_row_value is not None:
                     value = prev_row_value if prev_row_value is not None else next_row_value

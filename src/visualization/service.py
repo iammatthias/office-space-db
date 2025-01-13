@@ -54,13 +54,17 @@ class VisualizationService:
     def get_image_path(self, sensor: str, start_time: datetime, end_time: datetime, interval: str = 'daily') -> Path:
         """
         Generate file path for visualization.
-        Images are stored by interval (daily/hourly) using ISO format.
+        Images are stored by interval (daily/hourly/minute) using ISO format.
+        For compound visualizations (minute interval), we use the end_time for naming
+        since it represents how much data is included.
         """
         # Ensure we're working with UTC times before converting to PST
         start_utc = start_time.astimezone(timezone.utc)
+        end_utc = end_time.astimezone(timezone.utc)
         
         # Convert to PST for file organization
         start_pst = convert_to_pst(start_utc)
+        end_pst = convert_to_pst(end_utc)
         
         # Create directory structure based on interval
         image_dir = self.output_dir / sensor / interval
@@ -69,6 +73,9 @@ class VisualizationService:
         # Generate filename with ISO format based on interval
         if interval == 'hourly':
             filename = f"{start_pst.strftime('%Y-%m-%dT%H')}.png"
+        elif interval == 'minute':
+            # For compound visualizations, use end_time for the filename
+            filename = f"{end_pst.strftime('%Y-%m-%dT%H%M')}.png"
         else:  # daily
             filename = f"{start_pst.date().isoformat()}.png"
         
@@ -104,7 +111,8 @@ class VisualizationService:
                     column=sensor['column'],
                     color_scheme=sensor['color_scheme'],
                     start_time=start_pst,
-                    end_time=end_pst
+                    end_time=end_pst,
+                    interval=interval
                 )
                 
                 # Save image to file
@@ -142,6 +150,74 @@ class VisualizationService:
                 )
                 pbar.update(len(self.sensors))
                 current = next_hour
+            
+    async def process_minute_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict):
+        """Process minute updates for all sensors with compounding time ranges."""
+        # Convert to PST for consistent midnight boundaries
+        start_pst = convert_to_pst(start_date)
+        end_pst = convert_to_pst(end_date)
+        
+        # Ensure we start at the beginning of a day
+        current = start_pst.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Calculate total minutes for progress bar
+        total_minutes = int((end_pst - current).total_seconds() / 60)
+        total_tasks = total_minutes * len(self.sensors)
+        
+        # First, fetch all data for each sensor for the entire time range
+        sensor_data = {}
+        for sensor in self.sensors:
+            data = await self.data_service.get_sensor_data(
+                sensor['column'],
+                start_date=start_pst.astimezone(timezone.utc),
+                end_date=end_pst.astimezone(timezone.utc)
+            )
+            if data:
+                sensor_data[sensor['column']] = data
+                logger.info(f"Retrieved {len(data)} data points for {sensor['column']} between {start_pst} and {end_pst}")
+            else:
+                logger.info(f"No data found for {sensor['column']} between {start_pst} and {end_pst}")
+                continue
+        
+        with tqdm(total=total_tasks, desc="Generating minute images") as pbar:
+            while current < end_pst:
+                next_minute = current + timedelta(minutes=1)
+                
+                # For each sensor that has data, generate a visualization
+                for sensor in self.sensors:
+                    if sensor['column'] not in sensor_data:
+                        pbar.update(1)
+                        continue
+                        
+                    # Filter data up to the current minute
+                    current_data = [
+                        point for point in sensor_data[sensor['column']]
+                        if point.time <= next_minute
+                    ]
+                    
+                    if current_data:
+                        image = self.generator.generate_visualization(
+                            data=current_data,
+                            column=sensor['column'],
+                            color_scheme=sensor['color_scheme'],
+                            start_time=start_pst,
+                            end_time=next_minute,
+                            interval='minute'
+                        )
+                        
+                        # Save image to file
+                        image_path = self.get_image_path(sensor['column'], start_pst, next_minute, 'minute')
+                        image.save(image_path)
+                        
+                        sensor_status[sensor['column']] = {
+                            'start_time': start_pst.isoformat(),
+                            'end_time': next_minute.isoformat(),
+                            'image_path': str(image_path)
+                        }
+                    
+                    pbar.update(1)
+                
+                current = next_minute
             
     async def generate_visualization(
         self,
@@ -228,6 +304,11 @@ class VisualizationService:
                 # Generate hourly visualizations for this day
                 await self.process_hourly_updates(current, next_day, sensor_status)
                 
+                # Generate minute visualizations for this day
+                # Start from the first data point for the first day
+                minute_start = first_point_time if current == start_date else current
+                await self.process_minute_updates(minute_start, next_day, sensor_status)
+                
                 current = next_day
         
         logger.info("Backfill complete")
@@ -273,6 +354,9 @@ class VisualizationService:
                 # Process hourly visualizations
                 await self.process_hourly_updates(today_midnight_pst, tomorrow_midnight_pst, sensor_status)
                 
+                # Process minute visualizations
+                await self.process_minute_updates(today_midnight_pst, tomorrow_midnight_pst, sensor_status)
+                
             except Exception as e:
                 logger.error(f"Update cycle error: {str(e)}")
                 await asyncio.sleep(60)
@@ -300,10 +384,10 @@ async def start_service(
     sensors = [
         {'column': 'temperature', 'color_scheme': 'redblue'},
         {'column': 'humidity', 'color_scheme': 'cyan'},
-        # {'column': 'pressure', 'color_scheme': 'green'},
-        # {'column': 'light', 'color_scheme': 'base'},
-        # {'column': 'uv', 'color_scheme': 'purple'},
-        # {'column': 'gas', 'color_scheme': 'green'}
+        {'column': 'pressure', 'color_scheme': 'green'},
+        {'column': 'light', 'color_scheme': 'base'},
+        {'column': 'uv', 'color_scheme': 'purple'},
+        {'column': 'gas', 'color_scheme': 'green'}
     ]
     
     service = VisualizationService(
