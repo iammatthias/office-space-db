@@ -99,20 +99,17 @@ class VisualizationGenerator:
         self.height = BASE_HEIGHT    # 1,825px high
         self.scale_factor = scale_factor
 
-    def generate_daily_visualization(
+    def generate_visualization(
         self,
         data: List[EnvironmentalData],
         column: str,
         color_scheme: str,
-        day_start: datetime
+        start_time: datetime
     ) -> Image:
-        """Generate a single-row visualization for a 24-hour period."""
-        # Ensure day_start is in PST and at midnight
-        day_start = convert_to_pst(day_start)
-        day_start = day_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Calculate row height for a single day
-        row_height = self.height  # For daily visualization, use full height
+        """Generate a visualization for a time period."""
+        # Ensure start_time is in PST and at midnight
+        start_time = convert_to_pst(start_time)
+        start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
         
         # Create image with full dimensions
         image = Image.new('RGB', (self.width, self.height))
@@ -123,7 +120,7 @@ class VisualizationGenerator:
         sorted_data = sorted(pst_data, key=lambda x: x[0])
         
         if not sorted_data:
-            logger.warning(f"No data points found for {column} on {day_start}")
+            logger.warning(f"No data points found for {column} at {start_time}")
             return image.resize(
                 (self.width * self.scale_factor, self.height * self.scale_factor),
                 Image.NEAREST
@@ -137,7 +134,7 @@ class VisualizationGenerator:
         # Create minute map
         minute_map = {}
         for time, value in sorted_data:
-            minutes = int((time - day_start).total_seconds() / 60)
+            minutes = int((time - start_time).total_seconds() / 60)
             if 0 <= minutes < MINUTES_IN_DAY:
                 minute_map[minutes] = value
         
@@ -153,7 +150,7 @@ class VisualizationGenerator:
                 if minute in minute_map:
                     value = minute_map[minute]
                 else:
-                    # Handle start/end of day gaps differently than mid-day nulls
+                    # Handle gaps differently based on position
                     if minute < first_data_minute:
                         # Before first data point, use first value
                         value = first_value
@@ -161,7 +158,7 @@ class VisualizationGenerator:
                         # After last data point, use last value
                         value = last_value
                     else:
-                        # Mid-day null - find nearest known values and interpolate
+                        # Find nearest known values and interpolate
                         before_value = None
                         after_value = None
                         before_minute = None

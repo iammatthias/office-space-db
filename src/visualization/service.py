@@ -187,20 +187,20 @@ class VisualizationService:
                 i += 1
         return data
 
-    def get_daily_image_path(self, sensor: str, timestamp: datetime) -> Path:
+    def get_image_path(self, sensor: str, timestamp: datetime) -> Path:
         """
-        Generate file path for daily image.
-        Daily images are stored by year/month/day and represent a single 24-hour period
+        Generate file path for visualization.
+        Images are stored by year/month/day and represent a time period
         at minute resolution (1440px wide).
         """
         pst_time = convert_to_pst(timestamp)
-        day_start = (pst_time - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_time = (pst_time - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
         # Create nested directory structure
-        image_dir = self.output_dir / sensor / str(day_start.year) / f"{day_start.month:02d}" / f"{day_start.day:02d}"
+        image_dir = self.output_dir / sensor / str(start_time.year) / f"{start_time.month:02d}" / f"{start_time.day:02d}"
         image_dir.mkdir(parents=True, exist_ok=True)
         
-        return image_dir / "daily.png"
+        return image_dir / "visualization.png"
 
     async def process_sensor_update(self, sensor: Dict[str, str], start_date: datetime, end_date: datetime, sensor_status: Dict):
         """Process update for a single sensor."""
@@ -212,23 +212,23 @@ class VisualizationService:
             )
             
             if data:
-                daily_image = self.generator.generate_daily_visualization(
+                image = self.generator.generate_visualization(
                     data=data,
                     column=sensor['column'],
                     color_scheme=sensor['color_scheme'],
-                    day_start=start_date
+                    start_time=start_date
                 )
                 
                 # Save image to file
-                image_path = self.get_daily_image_path(sensor['column'], end_date)
-                daily_image.save(image_path)
+                image_path = self.get_image_path(sensor['column'], end_date)
+                image.save(image_path)
                 
                 sensor_status[sensor['column']] = {
                     'last_update': end_date.isoformat(),
-                    'daily_path': str(image_path)
+                    'image_path': str(image_path)
                 }
                 
-                logger.info(f"Saved daily visualization for {sensor['column']} to {image_path}")
+                logger.info(f"Saved visualization for {sensor['column']} to {image_path}")
         except Exception as e:
             logger.error(f"Error updating {sensor['column']}: {str(e)}")
             raise
@@ -274,7 +274,7 @@ class VisualizationService:
         # Initial backfill
         await self.backfill()
         
-        logger.info("Starting daily updates")
+        logger.info("Starting updates")
         
         sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
         
@@ -290,7 +290,7 @@ class VisualizationService:
                 logger.info(f"Next update in {int(wait_seconds)} seconds")
                 await asyncio.sleep(wait_seconds)
                 
-                # Process the previous day
+                # Process the previous period
                 start_time = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
                 end_time = tomorrow
                 
