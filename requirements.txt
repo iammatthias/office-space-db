@@ -7,3 +7,4 @@ cloudflare>=2.8.15
 boto3>=1.26.0  # For R2 compatibility
 aioboto3>=11.0.0  # For async R2 operations
 tqdm>=4.66.0  # For progress bars
+requests>=2.31.0

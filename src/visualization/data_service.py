@@ -7,9 +7,16 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 import logging
 from zoneinfo import ZoneInfo
+from functools import partial
 
 from .utils import EnvironmentalData, convert_to_pst
 from .sqlite_service import SQLiteService
+from .migrate_to_sqlite import sync_since_timestamp
+from config.config import (
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
+from supabase.client import create_client
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +27,7 @@ class DataService:
         """Initialize the data service."""
         self.update_interval = timedelta(minutes=update_interval_minutes)
         self.sqlite_service = SQLiteService(db_path)
+        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         self.column_map = {
             'temperature': 'temp',
             'humidity': 'hum',
@@ -43,9 +51,35 @@ class DataService:
         await self._fetch_all_historical_data()
         logger.info("Data service initialized")
         
-        # Start background update task
+        # Start background update tasks
         asyncio.create_task(self._periodic_update())
+        asyncio.create_task(self._periodic_supabase_sync())
         
+    async def _periodic_supabase_sync(self):
+        """Periodically sync with Supabase to get new data."""
+        while True:
+            try:
+                # Wait for the update interval
+                await asyncio.sleep(self.update_interval.total_seconds())
+                
+                # Get last timestamp from SQLite
+                last_timestamp = await self.sqlite_service.get_last_timestamp()
+                if last_timestamp:
+                    # Sync new data from Supabase
+                    synced_count = await sync_since_timestamp(
+                        self.supabase,
+                        self.sqlite_service,
+                        last_timestamp
+                    )
+                    
+                    if synced_count > 0:
+                        # If we got new data, refresh our in-memory cache
+                        await self._fetch_new_data()
+                        
+            except Exception as e:
+                logger.error(f"Error syncing with Supabase: {e}")
+                await asyncio.sleep(60)  # Wait a minute before retrying
+                
     async def _fetch_all_historical_data(self):
         """Fetch all historical data from the database."""
         async with self._update_lock:
@@ -173,58 +207,88 @@ class DataService:
         return valid_data
         
     def _interpolate_missing_values(self, data: List[EnvironmentalData]) -> List[EnvironmentalData]:
-        """Replace None values with linear interpolation based on nearest neighbors."""
-        i = 0
-        n = len(data)
-        while i < n:
-            if data[i].value is None:
-                start_idx = i - 1
-                while i < n and data[i].value is None:
-                    i += 1
-                end_idx = i
+        """Interpolate missing values in the data."""
+        if not data:
+            return data
+            
+        # Find runs of None values
+        runs = []
+        start_idx = None
+        
+        for i, point in enumerate(data):
+            if point.value is None:
+                if start_idx is None:
+                    start_idx = i
+            elif start_idx is not None:
+                runs.append((start_idx, i))
+                start_idx = None
                 
-                if start_idx >= 0 and end_idx < n:
-                    start_val = data[start_idx].value
-                    end_val = data[end_idx].value
-                    gap_len = end_idx - start_idx
-                    if start_val is not None and end_val is not None:
-                        step = (end_val - start_val) / gap_len
-                        for fill_idx in range(start_idx + 1, end_idx):
-                            offset = fill_idx - start_idx
-                            data[fill_idx].value = start_val + step * offset
-                    else:
-                        for fill_idx in range(start_idx + 1, end_idx):
-                            data[fill_idx].value = start_val if start_val is not None else end_val
-                else:
-                    if start_idx < 0 and end_idx < n:
-                        for fill_idx in range(end_idx):
-                            data[fill_idx].value = data[end_idx].value
-                    elif start_idx >= 0 and end_idx >= n:
-                        for fill_idx in range(start_idx+1, n):
-                            data[fill_idx].value = data[start_idx].value
+        if start_idx is not None:
+            runs.append((start_idx, len(data)))
+            
+        # Interpolate each run
+        for start, end in runs:
+            if start == 0:
+                # Fill forward from next valid value
+                next_valid = next((i for i in range(end, len(data)) if data[i].value is not None), None)
+                if next_valid is not None:
+                    for i in range(start, end):
+                        data[i] = EnvironmentalData(data[i].time, data[next_valid].value)
+            elif end == len(data):
+                # Fill backward from last valid value
+                for i in range(start, end):
+                    data[i] = EnvironmentalData(data[i].time, data[start-1].value)
             else:
-                i += 1
+                # Interpolate between valid values
+                left_val = data[start-1].value
+                right_val = data[end].value
+                total_gap = end - start + 1
+                for i in range(start, end):
+                    weight = (i - start + 1) / total_gap
+                    interpolated = left_val * (1 - weight) + right_val * weight
+                    data[i] = EnvironmentalData(data[i].time, interpolated)
+                    
         return data
 
-    def get_earliest_data_point(self, sensor: str) -> Optional[EnvironmentalData]:
-        """Get the earliest data point for a given sensor."""
+    async def get_earliest_data_point(self, sensor: str) -> Optional[EnvironmentalData]:
+        """Get the earliest data point for a sensor."""
         try:
-            # Get the first data point from the database
-            query = f"""
-                SELECT time, {self.column_map[sensor]} as value
-                FROM sensor_data
-                WHERE {self.column_map[sensor]} IS NOT NULL
-                ORDER BY time ASC
-                LIMIT 1
-            """
-            result = self.sqlite_service.execute_query(query)
-            if result:
-                time_str, value = result[0]
+            if sensor not in self.column_map:
+                return None
+                
+            # Get the earliest point from SQLite
+            async with self._update_lock:
+                if not self.sqlite_service:
+                    await self.initialize()
+                    
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    partial(
+                        self._get_earliest_data_point_sync,
+                        sensor
+                    )
+                )
+                return result
+        except Exception as e:
+            logger.error(f"Error getting earliest data point for {sensor}: {str(e)}")
+            return None
+            
+    def _get_earliest_data_point_sync(self, sensor: str) -> Optional[EnvironmentalData]:
+        """Synchronous helper to get earliest data point."""
+        try:
+            db_column = self.column_map[sensor]
+            cursor = self.sqlite_service.conn.execute(
+                f"SELECT time, {db_column} FROM environmental_data WHERE {db_column} IS NOT NULL ORDER BY time ASC LIMIT 1"
+            )
+            row = cursor.fetchone()
+            if row:
+                time_str, value = row
                 return EnvironmentalData(
                     time=datetime.fromisoformat(time_str).replace(tzinfo=timezone.utc),
                     value=float(value)
                 )
             return None
         except Exception as e:
-            logger.error(f"Error getting earliest data point for {sensor}: {str(e)}")
+            logger.error(f"Error in _get_earliest_data_point_sync for {sensor}: {str(e)}")
             return None 

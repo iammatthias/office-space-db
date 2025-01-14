@@ -24,7 +24,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 MINUTES_IN_DAY = 1440  # 1px per minute
-BASE_HEIGHT = 1825     # Base height for single row
+BASE_HEIGHT = 1825     # Fixed height for all visualizations
 SCALE_FACTOR = 4      # Default scale factor for final output
 
 COLOR_SCHEMES = {
@@ -96,26 +96,27 @@ class VisualizationGenerator:
     def __init__(self, scale_factor: int = 4):
         """Initialize the visualization generator."""
         self.width = MINUTES_IN_DAY  # 1440 minutes in a day
+        self.height = BASE_HEIGHT    # Fixed height for all visualizations
         self.scale_factor = scale_factor
 
-    def _calculate_row_height(self, num_rows: int) -> int:
-        """Calculate row height based on number of rows."""
-        # For minute-based visualizations, we want to ensure the row height
-        # scales appropriately with the number of rows
-        return max(1, math.floor(BASE_HEIGHT / num_rows))
-
-    def _get_row_and_minute(self, timestamp: datetime, start_time: datetime) -> Tuple[int, int]:
-        """Get row index and minute offset for a timestamp."""
-        pst_time = convert_to_pst(timestamp)
-        start_pst = convert_to_pst(start_time)
-        
-        # Calculate days since start (row index)
-        days_since_start = (pst_time.date() - start_pst.date()).days
-        
-        # Calculate minute within the day
-        minute = pst_time.hour * 60 + pst_time.minute
-        
-        return days_since_start, minute
+    def _calculate_row_boundaries(self, num_rows: int) -> List[Tuple[int, int]]:
+        """Calculate the exact pixel boundaries for each row.
+        Returns a list of (start, end) tuples for each row that precisely
+        divides the total height while handling fractional pixels.
+        """
+        row_boundaries = []
+        for row in range(num_rows):
+            # Calculate exact floating point positions
+            start_float = (row * self.height) / num_rows
+            end_float = ((row + 1) * self.height) / num_rows
+            # Round to nearest pixel
+            start = round(start_float)
+            end = round(end_float)
+            # Ensure no gaps between rows
+            if row > 0:
+                start = row_boundaries[-1][1]
+            row_boundaries.append((start, end))
+        return row_boundaries
 
     def generate_visualization(
         self,
@@ -135,24 +136,20 @@ class VisualizationGenerator:
         end_time = convert_to_pst(end_time)
         
         # Calculate number of days needed (partial days count as full days)
-        # Get the start and end dates in PST, as we always want to align to PST midnight boundaries
         start_date = start_time.date()
         end_date = end_time.date()
         if end_time.time() > time(0, 0):  # If end time is not midnight, we need one more day
             end_date += timedelta(days=1)
         num_rows = (end_date - start_date).days
         
-        row_height = self._calculate_row_height(num_rows)
-        total_height = row_height * num_rows
-        
-        # Create image with calculated dimensions
-        image = Image.new('RGB', (self.width, total_height))
+        # Create image with fixed dimensions
+        image = Image.new('RGB', (self.width, self.height))
         pixels = image.load()
         
         if not data:
             logger.warning(f"No data points found for {column} between {start_time} and {end_time}")
             return image.resize(
-                (self.width * self.scale_factor, total_height * self.scale_factor),
+                (self.width * self.scale_factor, self.height * self.scale_factor),
                 Image.NEAREST
             )
         
@@ -188,10 +185,14 @@ class VisualizationGenerator:
                     closest_values[row + 1] = {'before': None, 'after': None}
                 closest_values[row + 1]['before'] = point.value
         
+        # Calculate exact row boundaries
+        row_boundaries = self._calculate_row_boundaries(num_rows)
+        
         # Fill pixels for each day
         for row in range(num_rows):
             minute_map = day_minute_maps.get(row, {})
             data_minutes = sorted(minute_map.keys()) if minute_map else []
+            row_start, row_end = row_boundaries[row]
             
             if data_minutes:
                 # Get the closest values for interpolation at row boundaries
@@ -249,8 +250,6 @@ class VisualizationGenerator:
                     # Get color and fill the column for this row
                     if value is not None:
                         color = get_color_for(value, min_value, max_value, color_scheme)
-                        row_start = row * row_height
-                        row_end = row_start + row_height
                         for y in range(row_start, row_end):
                             pixels[minute, y] = color
             else:
@@ -261,14 +260,13 @@ class VisualizationGenerator:
                 if prev_row_value is not None or next_row_value is not None:
                     value = prev_row_value if prev_row_value is not None else next_row_value
                     color = get_color_for(value, min_value, max_value, color_scheme)
-                    row_start = row * row_height
-                    row_end = row_start + row_height
                     for minute in range(MINUTES_IN_DAY):
                         for y in range(row_start, row_end):
                             pixels[minute, y] = color
-            
+        
+        # Scale the image to final dimensions
         return image.resize(
-            (self.width * self.scale_factor, total_height * self.scale_factor),
+            (self.width * self.scale_factor, self.height * self.scale_factor),
             Image.NEAREST
         )
     
