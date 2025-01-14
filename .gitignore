@@ -3,5 +3,5 @@ __pycache__/
 .env
 .DS_Store
 venv
-data/visualizations
+data/visualizations*
 *.db*

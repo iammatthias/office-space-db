@@ -64,7 +64,7 @@ class VisualizationService:
         output_dir: str = "data/visualizations",
         scale_factor: int = 4,
         max_workers: int = None,  # None means use CPU count
-        batch_size: int = 120  # Number of images to process in parallel
+        batch_size: int = 20  # Number of images to process in parallel
     ):
         """Initialize the visualization service."""
         self.output_dir = Path(output_dir)
@@ -439,6 +439,56 @@ class VisualizationService:
             logger.error(f"Error generating visualization for {sensor}: {str(e)}")
             raise
             
+    def _find_latest_image(self, sensor: str, interval: str) -> Optional[Tuple[datetime, datetime]]:
+        """Find the latest image for a given sensor and interval type.
+        Returns a tuple of (start_time, end_time) in PST timezone if found, None otherwise.
+        """
+        image_dir = self.output_dir / sensor / interval
+        if not image_dir.exists():
+            return None
+
+        try:
+            # List all image files and sort by name (which includes timestamp)
+            image_files = sorted(image_dir.glob("*.png"))
+            if not image_files:
+                return None
+
+            # Get the latest image file
+            latest_file = image_files[-1]
+            
+            # Parse the filename to get the date and minutes
+            # Format: YYYY-MM-DD_DDDD_MMMM.png
+            date_str, days_str, minutes_str = latest_file.stem.split('_')
+            date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=ZoneInfo('America/Los_Angeles'))
+            minutes = int(minutes_str)
+            
+            # Calculate end time based on the minutes
+            end_time = date.replace(
+                hour=minutes // 60,
+                minute=minutes % 60,
+                second=0,
+                microsecond=0
+            )
+            
+            # Calculate start time based on interval
+            if interval == 'daily':
+                start_time = end_time.replace(hour=0, minute=0) - timedelta(days=int(days_str))
+            elif interval == 'hourly':
+                start_time = end_time.replace(minute=0)
+            else:  # minute
+                # For minute interval, we need to look at the data to find the actual start time
+                # This is because we use compound visualization
+                first_data = self.data_service.get_earliest_data_point(sensor)
+                if first_data:
+                    start_time = convert_to_pst(first_data.time)
+                else:
+                    start_time = end_time - timedelta(minutes=1)
+
+            return start_time, end_time
+        except Exception as e:
+            logger.error(f"Error finding latest image for {sensor}/{interval}: {str(e)}")
+            return None
+
     async def backfill(self):
         """Backfill visualizations from last stored image to current time."""
         logger.info("Starting backfill process")
@@ -454,58 +504,93 @@ class VisualizationService:
         
         first_point_time = first_data[0].time
         first_point_pst = convert_to_pst(first_point_time)
-        start_date = first_point_pst.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Find latest images for each sensor and interval
+        latest_times = {}
+        for sensor in self.sensors:
+            latest_times[sensor['column']] = {
+                interval: self._find_latest_image(sensor['column'], interval)
+                for interval in ['daily', 'hourly', 'minute']
+            }
+            
+            # Log the latest times found
+            logger.info(f"Latest images for {sensor['column']}:")
+            for interval, times in latest_times[sensor['column']].items():
+                if times:
+                    logger.info(f"  - {interval}: {times[0].isoformat()} to {times[1].isoformat()}")
+                else:
+                    logger.info(f"  - {interval}: No existing images")
+        
+        # Initialize start dates based on latest images or first data point
+        start_dates = {
+            'daily': first_point_pst.replace(hour=0, minute=0, second=0, microsecond=0),
+            'hourly': first_point_pst.replace(minute=0, second=0, microsecond=0),
+            'minute': first_point_pst
+        }
+        
+        # Update start dates based on latest images
+        for sensor in self.sensors:
+            for interval in ['daily', 'hourly', 'minute']:
+                latest = latest_times[sensor['column']][interval]
+                if latest:
+                    _, end_time = latest
+                    if interval == 'daily':
+                        next_start = end_time.replace(hour=0, minute=0) + timedelta(days=1)
+                    elif interval == 'hourly':
+                        next_start = end_time.replace(minute=0) + timedelta(hours=1)
+                    else:  # minute
+                        next_start = end_time + timedelta(minutes=1)
+                    
+                    start_dates[interval] = max(start_dates[interval], next_start)
         
         sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
         
-        total_days = (today_midnight_pst - start_date).days
-        total_daily_tasks = total_days * len(self.sensors)
+        # Process daily visualizations
+        if start_dates['daily'] < today_midnight_pst:
+            total_days = (today_midnight_pst - start_dates['daily']).days
+            total_daily_tasks = total_days * len(self.sensors)
+            logger.info(f"Processing {total_days} days of data for {len(self.sensors)} sensors")
+            
+            with tqdm(total=total_daily_tasks, desc="Generating daily images") as pbar:
+                current = start_dates['daily']
+                while current < today_midnight_pst:
+                    next_day = current + timedelta(days=1)
+                    logger.info(f"Processing day {current.date()} to {next_day.date()}")
+                    
+                    batch_tasks = [
+                        (sensor, current, next_day, sensor_status, 'daily')
+                        for sensor in self.sensors
+                    ]
+                    await self.process_sensor_batch(batch_tasks, pbar)
+                    current = next_day
         
-        logger.info(f"Processing {total_days} days of data for {len(self.sensors)} sensors")
+        # Process hourly visualizations
+        if start_dates['hourly'] < now_pst:
+            await self.process_hourly_updates(start_dates['hourly'], now_pst, sensor_status)
         
-        # Get all data upfront for compound visualizations
-        compound_data = {}
-        for sensor in self.sensors:
-            data = await self.data_service.get_sensor_data(
-                sensor['column'],
-                start_date=first_point_time.astimezone(timezone.utc),
-                end_date=now.astimezone(timezone.utc)
+        # Process minute visualizations
+        if start_dates['minute'] < now_pst:
+            # Get all data for compound visualizations
+            compound_data = {}
+            for sensor in self.sensors:
+                data = await self.data_service.get_sensor_data(
+                    sensor['column'],
+                    start_date=first_point_time.astimezone(timezone.utc),
+                    end_date=now.astimezone(timezone.utc)
+                )
+                if data:
+                    compound_data[sensor['column']] = data
+                    logger.info(f"Retrieved {len(data)} total data points for {sensor['column']}")
+            
+            await self.process_minute_updates(
+                start_date=start_dates['minute'],
+                end_date=now_pst,
+                sensor_status=sensor_status,
+                existing_data=compound_data
             )
-            if data:
-                compound_data[sensor['column']] = data
-                logger.info(f"Retrieved {len(data)} total data points for {sensor['column']}")
-        
-        with tqdm(total=total_daily_tasks, desc="Generating daily images") as pbar:
-            current = start_date
-            while current < today_midnight_pst:
-                next_day = current + timedelta(days=1)
-                logger.info(f"Processing day {current.date()} to {next_day.date()}")
-                
-                # Create batch tasks for daily processing
-                batch_tasks = [
-                    (sensor, current, next_day, sensor_status, 'daily')
-                    for sensor in self.sensors
-                ]
-                
-                # Process the batch
-                await self.process_sensor_batch(batch_tasks, pbar)
-                
-                # Generate hourly visualizations for this day
-                await self.process_hourly_updates(current, next_day, sensor_status)
-                
-                current = next_day
-        
-        # Process minute visualizations as a continuous stream
-        logger.info("Processing minute visualizations as continuous stream")
-        await self.process_minute_updates(
-            start_date=first_point_time,  # Start from first data point
-            end_date=now,                 # End at current time
-            sensor_status=sensor_status,
-            existing_data=compound_data    # Use all data for compound visualization
-        )
         
         logger.info("Backfill complete")
-        
+
     async def run(self):
         """Run the visualization service."""
         logger.info("Starting visualization service...")

@@ -204,4 +204,27 @@ class DataService:
                             data[fill_idx].value = data[start_idx].value
             else:
                 i += 1
-        return data 
+        return data
+
+    def get_earliest_data_point(self, sensor: str) -> Optional[EnvironmentalData]:
+        """Get the earliest data point for a given sensor."""
+        try:
+            # Get the first data point from the database
+            query = f"""
+                SELECT time, {self.column_map[sensor]} as value
+                FROM sensor_data
+                WHERE {self.column_map[sensor]} IS NOT NULL
+                ORDER BY time ASC
+                LIMIT 1
+            """
+            result = self.sqlite_service.execute_query(query)
+            if result:
+                time_str, value = result[0]
+                return EnvironmentalData(
+                    time=datetime.fromisoformat(time_str).replace(tzinfo=timezone.utc),
+                    value=float(value)
+                )
+            return None
+        except Exception as e:
+            logger.error(f"Error getting earliest data point for {sensor}: {str(e)}")
+            return None 
