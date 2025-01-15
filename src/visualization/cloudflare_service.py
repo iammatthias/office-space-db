@@ -3,7 +3,7 @@ import json
 import logging
 import requests
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 from config.config import (
     CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_ACCESS_KEY_ID,
@@ -53,9 +53,10 @@ class CloudflareService:
             logger.error(f"Error uploading image to R2: {str(e)}")
             raise
     
-    def update_kv_record(self, key: str, value: str) -> bool:
+    def update_kv_record(self, key: str, value: Union[str, dict]) -> bool:
         """
         Update a KV record with the given key and value.
+        Value can be either a string or a dictionary.
         Returns True if successful, False otherwise.
         """
         try:

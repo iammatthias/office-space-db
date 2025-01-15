@@ -265,17 +265,31 @@ class VisualizationService:
             raise
 
     async def _update_kv_records(self, interval: str, sensor_status: Dict):
-        """Update KV records for all sensors after a batch completes."""
+        """Update KV records for all sensors after a batch completes.
+        Stores detailed information about the last processed state.
+        """
         try:
             for sensor in self.sensors:
                 if sensor['column'] in sensor_status and sensor_status[sensor['column']].get('image_path'):
                     kv_key = self.get_kv_key(sensor['column'], interval)
-                    # Just store the path, not the full URL
-                    path = sensor_status[sensor['column']]['image_path']
-                    self.cloudflare.update_kv_record(kv_key, path)
-                    await self.async_logger.log(logging.INFO, f"Updated KV record for {sensor['column']} {interval}")
+                    # Store detailed information about the processed state
+                    kv_data = {
+                        'path': sensor_status[sensor['column']]['image_path'],
+                        'last_processed': datetime.now(timezone.utc).isoformat(),
+                        'last_success': sensor_status[sensor['column']].get('last_success'),
+                        'last_error': sensor_status[sensor['column']].get('last_error'),
+                        'status': 'success' if not sensor_status[sensor['column']].get('last_error') else 'error'
+                    }
+                    # Pass the dictionary directly to update_kv_record - it will handle the JSON encoding
+                    self.cloudflare.update_kv_record(kv_key, kv_data)
+                    await self.async_logger.log(
+                        logging.INFO,
+                        f"Updated KV record for {sensor['column']} {interval} with status {kv_data['status']}"
+                    )
         except Exception as e:
             await self.async_logger.log(logging.ERROR, f"Error updating KV records: {str(e)}")
+            # Don't raise the exception - we want to continue processing even if KV update fails
+            # The next run will detect the inconsistency and handle it appropriately
 
     async def process_sensor_update(
         self,
@@ -541,14 +555,42 @@ class VisualizationService:
             if not kv_value:
                 return None
                 
-            # Parse the JSON response
+            # Parse the JSON response - handle double encoding
             try:
+                outer_data = json.loads(kv_value)
+                # Handle KV API response format which includes a 'value' field
+                if isinstance(outer_data, dict) and 'value' in outer_data:
+                    kv_value = outer_data['value']
+                
                 kv_data = json.loads(kv_value)
-                path = kv_data.get('value')
+                # Handle both old format (string path) and new format (JSON object)
+                if isinstance(kv_data, dict):
+                    path = kv_data.get('path')
+                    # If we have last_processed time, use that directly
+                    if kv_data.get('last_processed'):
+                        try:
+                            last_processed = datetime.fromisoformat(kv_data['last_processed'])
+                            # Convert to PST for consistency
+                            return None, convert_to_pst(last_processed)
+                        except (ValueError, TypeError):
+                            # If timestamp parsing fails, fall back to path parsing
+                            pass
+                else:
+                    path = kv_value
+                
                 if not path:
                     return None
+                    
+                # Check if the record indicates an error state
+                if isinstance(kv_data, dict) and kv_data.get('status') == 'error':
+                    await self.async_logger.log(
+                        logging.WARNING,
+                        f"Found error state in KV for {sensor} {interval}. Will reprocess."
+                    )
+                    return None
+                    
             except json.JSONDecodeError:
-                # If not JSON, assume the value is the path directly
+                # If not JSON, assume the value is the path directly (old format)
                 path = kv_value
             
             # Parse the filename to get the date and minutes
@@ -558,43 +600,52 @@ class VisualizationService:
                 if len(parts) != 3:
                     return None
                     
-                filename = parts[2].replace('.png', '')
-                date_str, days_str, minutes_str = filename.split('_')
+                date_parts = parts[2].split('_')
+                if len(date_parts) != 3:
+                    return None
+                    
+                base_date = datetime.strptime(date_parts[0], '%Y-%m-%d')
+                days_offset = int(date_parts[1])
+                minutes_offset = int(date_parts[2].split('.')[0])
                 
-                # Parse the date
-                date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=ZoneInfo('America/Los_Angeles'))
-                days = int(days_str)
-                minutes = int(minutes_str)
+                # Convert to PST timezone
+                base_date = base_date.replace(tzinfo=ZoneInfo('America/Los_Angeles'))
                 
-                # Calculate end time based on the minutes
-                end_time = date.replace(
-                    hour=minutes // 60,
-                    minute=minutes % 60,
-                    second=0,
-                    microsecond=0
-                )
+                # Calculate end time
+                end_time = base_date
+                if interval == 'daily':
+                    end_time = end_time.replace(hour=23, minute=59)
+                elif interval == 'hourly':
+                    end_time = end_time.replace(hour=minutes_offset // 60, minute=59)
+                else:  # minute
+                    end_time = end_time.replace(hour=minutes_offset // 60, minute=minutes_offset % 60)
                 
                 # Calculate start time based on interval
                 if interval == 'daily':
-                    start_time = end_time.replace(hour=0, minute=0) - timedelta(days=days)
+                    start_time = end_time.replace(hour=0, minute=0)
                 elif interval == 'hourly':
                     start_time = end_time.replace(minute=0)
                 else:  # minute
-                    # For minute interval, we need to look at the data to find the actual start time
-                    first_data = await self.data_service.get_earliest_data_point(sensor)
-                    if first_data:
-                        start_time = convert_to_pst(first_data.time)
-                    else:
-                        start_time = end_time - timedelta(minutes=1)
-
+                    start_time = end_time
+                
+                # Adjust for days offset
+                end_time = end_time - timedelta(days=days_offset)
+                start_time = start_time - timedelta(days=days_offset)
+                
                 return start_time, end_time
                 
             except (ValueError, IndexError) as e:
-                logger.error(f"Error parsing image path {path}: {str(e)}")
+                await self.async_logger.log(
+                    logging.ERROR,
+                    f"Error parsing image path {path} for {sensor} {interval}: {str(e)}"
+                )
                 return None
                 
         except Exception as e:
-            logger.error(f"Error finding latest image for {sensor}/{interval}: {str(e)}")
+            await self.async_logger.log(
+                logging.ERROR,
+                f"Error finding latest image for {sensor} {interval}: {str(e)}"
+            )
             return None
 
     async def backfill(self):
@@ -725,21 +776,87 @@ class VisualizationService:
             await self.async_logger.stop()  # Ensure logger is stopped
             
     async def _get_last_processed_time(self, interval: str) -> Optional[datetime]:
-        """Get the last processed time for a given interval from KV."""
+        """Get the last processed time for a given interval from KV.
+        KV is treated as the source of truth for resumption.
+        """
         try:
             # Check each sensor's last processed time and return the earliest
             earliest_time = None
+            latest_time = None
+            missing_sensors = []
+
             for sensor in self.sensors:
                 kv_key = self.get_kv_key(sensor['column'], interval)
-                path = self.cloudflare.get_kv_record(kv_key)
-                if path:
+                kv_value = self.cloudflare.get_kv_record(kv_key)
+                
+                if kv_value:
+                    try:
+                        # Handle double-encoded JSON from KV
+                        outer_data = json.loads(kv_value)
+                        # Handle KV API response format which includes a 'value' field
+                        if isinstance(outer_data, dict) and 'value' in outer_data:
+                            kv_value = outer_data['value']
+                        
+                        kv_data = json.loads(kv_value)
+                        if isinstance(kv_data, dict):
+                            # First try to get the last_processed timestamp
+                            if kv_data.get('last_processed'):
+                                try:
+                                    last_processed = datetime.fromisoformat(kv_data['last_processed'])
+                                    last_processed_pst = convert_to_pst(last_processed)
+                                    if earliest_time is None or last_processed_pst < earliest_time:
+                                        earliest_time = last_processed_pst
+                                    if latest_time is None or last_processed_pst > latest_time:
+                                        latest_time = last_processed_pst
+                                    continue  # Skip to next sensor if we successfully got timestamp
+                                except (ValueError, TypeError):
+                                    pass  # Fall through to path parsing if timestamp invalid
+                    except json.JSONDecodeError:
+                        pass  # Fall through to path parsing if not JSON
+                    
+                    # Fall back to parsing the path if we couldn't get timestamp
                     times = await self._find_latest_image(sensor['column'], interval)
-                    if times and (earliest_time is None or times[1] < earliest_time):
-                        earliest_time = times[1]
-            return earliest_time
+                    if times:
+                        _, end_time = times  # We only care about the end time
+                        if earliest_time is None or end_time < earliest_time:
+                            earliest_time = end_time
+                        if latest_time is None or end_time > latest_time:
+                            latest_time = end_time
+                else:
+                    missing_sensors.append(sensor['column'])
+
+            if missing_sensors:
+                await self.async_logger.log(
+                    logging.INFO,
+                    f"No KV records found for sensors {', '.join(missing_sensors)} with interval {interval}. Will process from the beginning."
+                )
+                return None
+            
+            if earliest_time and latest_time:
+                # If there's more than 2 intervals difference between earliest and latest,
+                # we should reprocess from the earliest to ensure consistency
+                interval_delta = self._get_interval_delta(interval)
+                if latest_time - earliest_time > interval_delta * 2:
+                    await self.async_logger.log(
+                        logging.WARNING,
+                        f"Large gap detected in {interval} processing times ({earliest_time} to {latest_time}). Will reprocess from {earliest_time}."
+                    )
+                return earliest_time
+            
+            return None
+            
         except Exception as e:
             await self.async_logger.log(logging.ERROR, f"Error getting last processed time: {str(e)}")
             return None
+
+    def _get_interval_delta(self, interval: str) -> timedelta:
+        """Get the timedelta for a given interval type."""
+        if interval == 'daily':
+            return timedelta(days=1)
+        elif interval == 'hourly':
+            return timedelta(hours=1)
+        else:  # minute
+            return timedelta(minutes=1)
 
     async def _run_daily_updates(self):
         """Run daily updates at midnight PST."""
