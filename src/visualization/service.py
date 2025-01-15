@@ -724,28 +724,64 @@ class VisualizationService:
         finally:
             await self.async_logger.stop()  # Ensure logger is stopped
             
+    async def _get_last_processed_time(self, interval: str) -> Optional[datetime]:
+        """Get the last processed time for a given interval from KV."""
+        try:
+            # Check each sensor's last processed time and return the earliest
+            earliest_time = None
+            for sensor in self.sensors:
+                kv_key = self.get_kv_key(sensor['column'], interval)
+                path = self.cloudflare.get_kv_record(kv_key)
+                if path:
+                    times = await self._find_latest_image(sensor['column'], interval)
+                    if times and (earliest_time is None or times[1] < earliest_time):
+                        earliest_time = times[1]
+            return earliest_time
+        except Exception as e:
+            await self.async_logger.log(logging.ERROR, f"Error getting last processed time: {str(e)}")
+            return None
+
     async def _run_daily_updates(self):
         """Run daily updates at midnight PST."""
         while True:
             try:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
-                today_midnight_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
-                tomorrow_midnight_pst = today_midnight_pst + timedelta(days=1)
+                current_midnight = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
                 
-                # Wait until next midnight
-                wait_seconds = (tomorrow_midnight_pst - now_pst).total_seconds()
+                # Get last processed time
+                last_processed = await self._get_last_processed_time('daily')
+                if not last_processed:
+                    # If no last processed time, start from beginning of current day
+                    start_time = current_midnight
+                else:
+                    # Ensure we don't process future data
+                    start_time = min(last_processed, now_pst)
+                    # Round down to midnight
+                    start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                # Calculate next midnight
+                next_midnight = current_midnight + timedelta(days=1)
+                
+                # Only process if we have a full day's worth of data
+                process_until = min(next_midnight, now_pst - timedelta(minutes=5))
+                
+                if start_time < process_until:
+                    # Process daily updates
+                    sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
+                    await self.process_daily_updates(start_time, process_until, sensor_status)
+                    # Update KV records
+                    await self._update_kv_records('daily', sensor_status)
+                
+                # Calculate wait time to next processing cycle
+                wait_seconds = max(0, (next_midnight - now_pst).total_seconds())
                 await self.async_logger.log(logging.INFO, f"Daily updates will run in {int(wait_seconds/3600)} hours")
                 await asyncio.sleep(wait_seconds)
-                
-                # Process daily updates
-                sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-                await self.process_daily_updates(today_midnight_pst, tomorrow_midnight_pst, sensor_status)
                 
             except Exception as e:
                 await self.async_logger.log(logging.ERROR, f"Error in daily update cycle: {str(e)}")
                 await asyncio.sleep(60)  # Wait a minute before retrying
-                
+
     async def _run_hourly_updates(self):
         """Run hourly updates at the start of each hour."""
         while True:
@@ -753,21 +789,40 @@ class VisualizationService:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
                 current_hour = now_pst.replace(minute=0, second=0, microsecond=0)
+                
+                # Get last processed time
+                last_processed = await self._get_last_processed_time('hourly')
+                if not last_processed:
+                    # If no last processed time, start from beginning of current hour
+                    start_time = current_hour
+                else:
+                    # Ensure we don't process future data
+                    start_time = min(last_processed, now_pst)
+                    # Round down to hour
+                    start_time = start_time.replace(minute=0, second=0, microsecond=0)
+                
+                # Calculate next hour
                 next_hour = current_hour + timedelta(hours=1)
                 
-                # Wait until next hour
-                wait_seconds = (next_hour - now_pst).total_seconds()
+                # Only process if we have enough data (wait 5 minutes after the hour)
+                process_until = min(next_hour, now_pst - timedelta(minutes=5))
+                
+                if start_time < process_until:
+                    # Process hourly updates
+                    sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
+                    await self.process_hourly_updates(start_time, process_until, sensor_status)
+                    # Update KV records
+                    await self._update_kv_records('hourly', sensor_status)
+                
+                # Calculate wait time to next processing cycle
+                wait_seconds = max(0, (next_hour - now_pst).total_seconds())
                 await self.async_logger.log(logging.INFO, f"Hourly updates will run in {int(wait_seconds/60)} minutes")
                 await asyncio.sleep(wait_seconds)
-                
-                # Process hourly updates
-                sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-                await self.process_hourly_updates(current_hour, next_hour, sensor_status)
                 
             except Exception as e:
                 await self.async_logger.log(logging.ERROR, f"Error in hourly update cycle: {str(e)}")
                 await asyncio.sleep(60)  # Wait a minute before retrying
-                
+
     async def _run_minute_updates(self):
         """Run minute updates every 5 minutes."""
         UPDATE_INTERVAL = timedelta(minutes=5)  # Update every 5 minutes
@@ -776,37 +831,70 @@ class VisualizationService:
             try:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
-                current_time = now_pst.replace(second=0, microsecond=0)
-                # Round to nearest 5 minutes
-                minutes = (current_time.minute // 5) * 5
-                current_time = current_time.replace(minute=minutes)
+                
+                # Round current time down to nearest 5 minutes
+                minutes = (now_pst.minute // 5) * 5
+                current_time = now_pst.replace(minute=minutes, second=0, microsecond=0)
+                
+                # Get last processed time
+                last_processed = await self._get_last_processed_time('minute')
+                if not last_processed:
+                    # If no last processed time, start from 5 minutes ago
+                    start_time = current_time - UPDATE_INTERVAL
+                else:
+                    # Ensure we don't process future data
+                    start_time = min(last_processed, now_pst)
+                    # Round down to nearest 5 minutes
+                    minutes = (start_time.minute // 5) * 5
+                    start_time = start_time.replace(minute=minutes, second=0, microsecond=0)
+                
                 next_time = current_time + UPDATE_INTERVAL
                 
-                # Wait until next update time
-                wait_seconds = (next_time - now_pst).total_seconds()
+                # Only process if we have enough data (wait 30 seconds after the 5-minute mark)
+                process_until = min(next_time, now_pst - timedelta(seconds=30))
+                
+                if start_time < process_until:
+                    # Process minute updates
+                    sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
+                    
+                    # Get all historical data for compound visualizations
+                    compound_data = {}
+                    first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
+                    
+                    if first_data:
+                        historical_start = convert_to_pst(first_data[0].time)
+                        
+                        # Fetch all historical data for each sensor
+                        for sensor in self.sensors:
+                            data = await self.data_service.get_sensor_data(
+                                sensor['column'],
+                                start_date=historical_start.astimezone(timezone.utc),
+                                end_date=process_until.astimezone(timezone.utc)
+                            )
+                            if data:
+                                compound_data[sensor['column']] = data
+                                await self.async_logger.log(
+                                    logging.DEBUG, 
+                                    f"Retrieved {len(data)} historical points for {sensor['column']} from {historical_start} to {process_until}"
+                                )
+                    
+                        await self.process_minute_updates(
+                            start_date=historical_start,
+                            end_date=process_until,
+                            sensor_status=sensor_status,
+                            existing_data=compound_data
+                        )
+                        
+                        # Update KV records
+                        await self._update_kv_records('minute', sensor_status)
+                    else:
+                        await self.async_logger.log(logging.WARNING, "No historical data found for minute updates")
+                
+                # Calculate wait time to next processing cycle
+                next_process_time = current_time + UPDATE_INTERVAL
+                wait_seconds = max(0, (next_process_time - now_pst).total_seconds())
                 await self.async_logger.log(logging.INFO, f"Minute updates will run in {int(wait_seconds)} seconds")
                 await asyncio.sleep(wait_seconds)
-                
-                # Process minute updates
-                sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-                
-                # Get all data for compound visualizations
-                compound_data = {}
-                for sensor in self.sensors:
-                    data = await self.data_service.get_sensor_data(
-                        sensor['column'],
-                        start_date=current_time.astimezone(timezone.utc),
-                        end_date=next_time.astimezone(timezone.utc)
-                    )
-                    if data:
-                        compound_data[sensor['column']] = data
-                
-                await self.process_minute_updates(
-                    start_date=current_time,
-                    end_date=next_time,
-                    sensor_status=sensor_status,
-                    existing_data=compound_data
-                )
                 
             except Exception as e:
                 await self.async_logger.log(logging.ERROR, f"Error in minute update cycle: {str(e)}")
