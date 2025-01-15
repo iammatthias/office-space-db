@@ -18,6 +18,7 @@ from .utils import (
     get_day_boundaries,
     convert_to_pst
 )
+from .color_schemes import COLOR_SCHEMES
 import math
 import logging
 
@@ -26,37 +27,6 @@ logger = logging.getLogger(__name__)
 MINUTES_IN_DAY = 1440  # 1px per minute
 BASE_HEIGHT = 1825     # Fixed height for all visualizations
 SCALE_FACTOR = 4      # Default scale factor for final output
-
-COLOR_SCHEMES = {
-    'redblue': [
-        # Dark blue (cold) to light blue
-        "#163B66", "#1A4F8C", "#205EA6", "#3171B2", "#4385BE", "#66A0C8",
-        "#92BFDB", "#ABCFE2", "#C6DDE8", "#E1ECEB",
-        # Light red to dark red (hot)
-        "#FFE1D5", "#FFCABB", "#FDB2A2", "#F89A8A", "#E8705F", "#D14D41",
-        "#C03E35", "#AF3029", "#942822", "#6C201C"
-    ],
-    'cyan': [
-        "#101F1D", "#122F2C", "#143F3C", "#164F4A", "#1C6C66", "#24837B",
-        "#2F968D", "#3AA99F", "#5ABDAC", "#87D3C3", "#A2DECE", "#BFE8D9",
-        "#DDF1E4"
-    ],
-    'base': [
-        "#1C1B1A", "#282726", "#343331", "#403E3C", "#575653", "#6F6E69",
-        "#878580", "#9F9D96", "#B7B5AC", "#CECDC3", "#DAD8CE", "#E6E4D9",
-        "#F2F0E5"
-    ],
-    'purple': [
-        "#1A1623", "#1A1623", "#261C39", "#31234E", "#3C2A62", "#5E409D",
-        "#735EB5", "#8B7EC8", "#A699D0", "#C4B9E0", "#D3CAE6", "#E2D9E9",
-        "#F0EAEC"
-    ],
-    'green': [
-        "#1A1E0C", "#252D09", "#313D07", "#3D4C07", "#536907", "#668008",
-        "#768D21", "#879A39", "#A8AF54", "#BEC97E", "#CDD597", "#DDE2B2",
-        "#EDEECF"
-    ]
-}
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     """Convert hex color string to RGB tuple."""
@@ -69,8 +39,8 @@ def get_color_for(value: float, min_value: float, max_value: float, scheme: str)
     normalized = (value - min_value) / (max_value - min_value) if max_value > min_value else 0.5
     normalized = min(max(normalized, 0.0), 1.0)
     
-    # Get the appropriate color scheme based on the column type
-    colors = COLOR_SCHEMES.get(scheme.split('_')[0], COLOR_SCHEMES['redblue'])
+    # Get the appropriate color scheme
+    colors = COLOR_SCHEMES.get(scheme, COLOR_SCHEMES['redblue'])
     
     # Calculate the floating point index and interpolate between colors
     float_index = normalized * (len(colors) - 1)
@@ -268,80 +238,4 @@ class VisualizationGenerator:
         return image.resize(
             (self.width * self.scale_factor, self.height * self.scale_factor),
             Image.NEAREST
-        )
-    
-    def _get_color(self, value: float, column: str, scheme: str) -> Tuple[int, int, int]:
-        """Get the color for a value based on the column type and color scheme."""
-        if column == 'temperature':
-            # Temperature: 10°C to 30°C (typical indoor range)
-            # Dark blue (cold) to Dark red (hot)
-            # We want light colors in the middle (around 20°C)
-            normalized = (value - 10) / 20  # Normalize from 10-30 range
-            normalized = min(max(normalized, 0.0), 1.0)
-            
-            if normalized < 0.5:
-                # Cold: Scale from dark blue to white
-                t = normalized * 2
-                return (
-                    int(255 * t),          # Red (0 -> 255)
-                    int(255 * t),          # Green (0 -> 255)
-                    255                     # Blue (always 255)
-                )
-            else:
-                # Hot: Scale from white to dark red
-                t = (normalized - 0.5) * 2
-                return (
-                    255,                    # Red (always 255)
-                    int(255 * (1 - t)),     # Green (255 -> 0)
-                    int(255 * (1 - t))      # Blue (255 -> 0)
-                )
-            
-        elif column == 'humidity':
-            # Humidity: 0% to 100%
-            # White (dry) to Cyan (humid)
-            normalized = value / 100
-            normalized = min(max(normalized, 0.0), 1.0)
-            return (
-                int(255 * (1 - normalized)), # Red
-                255,                         # Green
-                255                          # Blue
-            )
-            
-        elif column == 'pressure':
-            # Pressure: 980 to 1020 hPa
-            # Dark green (low) to bright green (high)
-            normalized = (value - 980) / 40  # Normalize from 980-1020 range
-            normalized = min(max(normalized, 0.0), 1.0)
-            intensity = int(255 * normalized)
-            return (0, intensity, 0)
-            
-        elif column == 'light':
-            # Light: 0 to 100000 lux (logarithmic scale)
-            # Black (dark) to White (bright)
-            if value <= 0:
-                normalized = 0
-            else:
-                normalized = min(math.log10(value) / 5.0, 1.0)  # log10(100000) ≈ 5
-            intensity = int(255 * normalized)
-            return (intensity, intensity, intensity)
-            
-        elif column == 'uv':
-            # UV: 0 to 11+ (UV index)
-            # Dark purple (low) to bright purple (high)
-            normalized = min(value / 11, 1.0)  # UV index goes from 0-11+
-            intensity = int(255 * normalized)
-            return (intensity, 0, intensity)
-            
-        elif column == 'gas':
-            # Gas: 0 to 100 (relative)
-            # Dark green (good) to bright green (poor)
-            normalized = value / 100
-            normalized = min(max(normalized, 0.0), 1.0)
-            intensity = int(255 * normalized)
-            return (0, intensity, 0)
-            
-        else:
-            # Default grayscale for unknown sensors
-            normalized = min(max(value / 100.0, 0.0), 1.0)
-            intensity = int(255 * normalized)
-            return (intensity, intensity, intensity) 
+        ) 

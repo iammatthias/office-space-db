@@ -6,4 +6,5 @@ venv
 data/visualizations*
 *.db*
 .log
-*.log
+visualization_service_debug.log
+visualization_service.log

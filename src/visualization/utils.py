@@ -36,40 +36,6 @@ def hex_to_rgb(hex_color: str) -> Tuple[float, float, float]:
     return tuple(int(hex_color[i:i+2], 16)/255 for i in (0, 2, 4))
 
 
-def get_color_for(value: float, min_val: float, max_val: float, color_scheme: str) -> Tuple[float, float, float]:
-    """
-    Get RGB color for a value based on the color scheme and value range.
-    Ensures smooth transitions at edges to prevent banding.
-    """
-    # Handle edge case where min and max are the same
-    if max_val == min_val:
-        normalized_value = 0.5
-    else:
-        # Simple linear normalization with clamping
-        normalized_value = (value - min_val) / (max_val - min_val)
-        normalized_value = max(0.0, min(1.0, normalized_value))
-    
-    scheme = COLOR_SCHEMES.get(color_scheme, COLOR_SCHEMES['redblue'])
-    scheme_max = len(scheme) - 1
-    
-    # Scale to color range, ensuring we never hit the exact edges
-    float_index = normalized_value * (scheme_max - 0.001)  # Prevent hitting last index
-    lower_index = int(float_index)
-    upper_index = min(lower_index + 1, scheme_max)
-    
-    # Get interpolation fraction
-    fraction = float_index - lower_index
-    
-    # Get colors and interpolate
-    lower_color = hex_to_rgb(scheme[lower_index])
-    upper_color = hex_to_rgb(scheme[upper_index])
-    
-    return tuple(
-        lower_color[i] * (1 - fraction) + upper_color[i] * fraction
-        for i in range(3)
-    )
-
-
 class EnvironmentalData:
     """Class to hold environmental data points."""
     def __init__(self, time: datetime, value: float):

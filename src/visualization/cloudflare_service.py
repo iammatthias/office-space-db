@@ -29,8 +29,13 @@ class CloudflareService:
         )
         self.bucket = R2_BUCKET_NAME
         
-        # KV API base URL
-        self.kv_base_url = f'https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/{KV_NAMESPACE_ID}'
+        # KV API base URL for updates
+        self.kv_base_url = (
+            f'https://api.cloudflare.com/client/v4/accounts/'
+            f'{CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/{KV_NAMESPACE_ID}'
+        )
+        # Image API endpoint for reads
+        self.image_api_url = 'https://image-api.office.pure---internet.com/'
         self.headers = {
             'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}',
             'Content-Type': 'application/json'
@@ -76,14 +81,36 @@ class CloudflareService:
         """
         Get a KV record value by key.
         Returns None if the key doesn't exist.
+        
+        This method fetches data from the image API for reads, while updates still go directly to KV.
+        The API returns data in a structure like:
+            {
+              "latest_sensor_interval": {
+                "value": {
+                  "path": "...",
+                  "last_processed": "...",
+                  "status": "success",
+                  ...
+                }
+              }
+            }
+        
+        We return a JSON string of the sub-object for 'key', or None if not found.
         """
         try:
-            url = f'{self.kv_base_url}/values/{key}'
-            response = requests.get(url, headers=self.headers)
-            if response.status_code == 404:
-                return None
+            logger.info(f"Fetching data from image API for key: {key}")
+            response = requests.get(self.image_api_url, headers=self.headers)
             response.raise_for_status()
-            return response.text
+            data = response.json()
+            logger.debug(f"Image API response for {key}: {json.dumps(data.get(key, {}), indent=2)}")
+            
+            if key in data:
+                # data[key] is typically a dict, e.g. {"value": {...}}
+                # Return as a JSON string so that the caller can parse it as needed
+                return json.dumps(data[key])  
+            
+            logger.debug(f"No value found for key {key}")
+            return None
         except Exception as e:
-            logger.error(f"Error getting KV record: {str(e)}")
-            return None 
+            logger.error(f"Error getting record from image API: {str(e)}")
+            return None

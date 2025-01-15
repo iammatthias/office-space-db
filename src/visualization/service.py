@@ -3,7 +3,7 @@
 import asyncio
 from datetime import datetime, timezone, timedelta, time
 import os
-from typing import List, Dict, Optional, Iterator, Tuple, Set
+from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 import json
 import logging
@@ -12,8 +12,6 @@ from pathlib import Path
 from tqdm.asyncio import tqdm
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-import itertools
 
 from .generator import VisualizationGenerator
 from .utils import EnvironmentalData, convert_to_pst
@@ -27,25 +25,27 @@ from config.config import (
 
 # Configure logging with a cleaner format
 logging.basicConfig(
-    level=logging.INFO,  # Change to INFO level by default
+    level=logging.INFO,
     format='%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S',
     handlers=[
-        logging.StreamHandler(),  # Console handler
-        logging.FileHandler('visualization_service.log')  # File handler for debugging
+        logging.StreamHandler(),
+        logging.FileHandler('visualization_service.log')
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Create a separate debug logger for detailed logging
+# A separate debug logger
 debug_logger = logging.getLogger(f"{__name__}.debug")
 debug_logger.setLevel(logging.DEBUG)
 debug_handler = logging.FileHandler('visualization_service_debug.log')
-debug_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s'))
+debug_handler.setFormatter(
+    logging.Formatter('%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s')
+)
 debug_logger.addHandler(debug_handler)
 
 class AsyncLogger:
-    """Asynchronous logger that batches messages and logs them in the background."""
+    """Asynchronous logger that batches messages."""
     
     def __init__(self, logger):
         self.logger = logger
@@ -56,18 +56,15 @@ class AsyncLogger:
         self.MAX_ERRORS = 100
     
     async def start(self):
-        """Start the background logging task."""
         if not self.running:
             self.running = True
             self.task = asyncio.create_task(self._process_logs())
     
     async def stop(self):
-        """Stop the background logging task."""
         if self.running:
             self.running = False
             if self.task:
                 try:
-                    # Give remaining logs a chance to process but don't block indefinitely
                     await asyncio.wait_for(self.queue.join(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
@@ -78,16 +75,15 @@ class AsyncLogger:
                     pass
     
     async def _process_logs(self):
-        """Process logs from the queue in the background."""
         while self.running:
             try:
-                # Use get_nowait() to avoid blocking when queue is empty
                 try:
                     level, msg = self.queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.1)  # Short sleep when queue is empty
+                    await asyncio.sleep(0.1)
                     continue
 
+                # Attempt logging
                 try:
                     if level == logging.DEBUG:
                         debug_logger.debug(msg)
@@ -96,17 +92,16 @@ class AsyncLogger:
                 except Exception as e:
                     self._error_count += 1
                     if self._error_count <= self.MAX_ERRORS:
-                        print(f"Error in logger: {str(e)}")
+                        print(f"Error in logger: {e}")
                 finally:
                     self.queue.task_done()
                     
             except Exception as e:
                 self._error_count += 1
                 if self._error_count <= self.MAX_ERRORS:
-                    print(f"Error in log processor: {str(e)}")
-                await asyncio.sleep(0.1)  # Prevent tight loop on repeated errors
+                    print(f"Error in log processor: {e}")
+                await asyncio.sleep(0.1)
                 
-        # Process remaining logs after running is set to False
         while not self.queue.empty():
             try:
                 level, msg = self.queue.get_nowait()
@@ -120,27 +115,21 @@ class AsyncLogger:
                 self.queue.task_done()
     
     async def log(self, level: int, msg: str):
-        """Asynchronously queue a log message."""
         if not self.running:
-            # Fall back to synchronous logging if not running
             if level == logging.DEBUG:
                 debug_logger.debug(msg)
             else:
                 self.logger.log(level, msg)
             return
-            
         try:
-            # Use put_nowait to avoid blocking
             self.queue.put_nowait((level, msg))
         except asyncio.QueueFull:
-            # If queue is full, log synchronously
             if level == logging.DEBUG:
                 debug_logger.debug(msg)
             else:
                 self.logger.log(level, msg)
 
     async def error(self, msg: str, exc_info: Optional[Exception] = None):
-        """Log an error message with optional exception info."""
         if exc_info:
             import traceback
             tb_str = ''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__))
@@ -148,7 +137,7 @@ class AsyncLogger:
         await self.log(logging.ERROR, msg)
 
 class ProgressManager:
-    """Manages progress bars and logging during batch operations."""
+    """Manages progress bars and optionally suppresses logging."""
     
     def __init__(self, total: int, desc: str, disable_logging: bool = True):
         self.total = total
@@ -158,12 +147,11 @@ class ProgressManager:
     
     @contextlib.asynccontextmanager
     async def progress_bar(self):
-        """Async context manager for progress bar that temporarily modifies logging."""
         self.async_logger = AsyncLogger(logger)
         await self.async_logger.start()
         
+        original_level = logger.getEffectiveLevel()
         if self.disable_logging:
-            logging_level = logger.getEffectiveLevel()
             logger.setLevel(logging.WARNING)
         
         try:
@@ -171,335 +159,353 @@ class ProgressManager:
                 yield pbar
         finally:
             if self.disable_logging:
-                logger.setLevel(logging_level)
-            # Ensure all logs are processed before closing
+                logger.setLevel(original_level)
             if self.async_logger:
                 await self.async_logger.stop()
 
 class VisualizationService:
     """Service for generating and managing environmental data visualizations."""
     
-    def __init__(
-        self,
-        sensors: List[Dict[str, str]],
-        config: Dict[str, any]
-    ):
-        """Initialize the visualization service with a configuration dictionary."""
-        self.config = config
+    def __init__(self, sensors: List[Dict[str, str]], config: Dict[str, any]):
         self.sensors = sensors
+        self.config = config
         self.output_dir = Path(config['output_dir'])
         self.data_service = DataService(config['db_path'])
-        self.batch_size = config['batch_size']
         self.async_logger = AsyncLogger(logger)
         
-        # Initialize thread pool for I/O operations
         self.thread_pool = ThreadPoolExecutor(max_workers=config['max_workers'])
-        
-        # Initialize visualization generator with scale factor
         self.generator = VisualizationGenerator(scale_factor=config['scale_factor'])
-        
-        # Initialize Cloudflare service
         self.cloudflare = CloudflareService()
-        
-        # Create output directory if it doesn't exist (for temporary files)
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Initialized visualization service:")
+        logger.info("Initialized visualization service:")
         logger.info(f"- Output directory: {config['output_dir']}")
         logger.info(f"- Sensors: {', '.join(s['column'] for s in sensors)}")
-        logger.info(f"- Batch size: {config['batch_size']}")
-        logger.info(f"- Scale factor: {config['scale_factor']}")
+        logger.info(f"- Batch size: {config.get('batch_size')}")
+        logger.info(f"- Scale factor: {config.get('scale_factor')}")
 
     async def initialize(self):
-        """Initialize async components of the service."""
+        """Initialize async services."""
         await self.async_logger.start()
         await self.data_service.initialize()
         logger.info("Initialized async components of visualization service")
 
-    def get_r2_key(self, sensor: str, start_time: datetime, end_time: datetime, interval: str = 'daily') -> str:
-        """Generate the R2 storage key for a visualization."""
-        # Convert to PST for consistent naming
+    def get_r2_key(self, sensor: str, start_time: datetime, end_time: datetime, interval: str) -> str:
+        """
+        Format: sensor/interval/YYYY-MM-DD_daysOffset_minutesOffset.png
+        We'll keep this original style, ignoring day offsets in _extract_end_time_from_path.
+        """
         start_pst = convert_to_pst(start_time)
         end_pst = convert_to_pst(end_time)
+        day_diff = (end_pst.date() - start_pst.date()).days
         
-        # Calculate days since start
-        days_since_start = (end_pst.date() - start_pst.date()).days
-        
-        # Calculate minutes since midnight based on interval
         if interval == 'daily':
-            minutes_since_midnight = 1439
+            minutes_offset = 1439
         elif interval == 'hourly':
-            minutes_since_midnight = end_pst.hour * 60 + 59
+            minutes_offset = end_pst.hour * 60 + 59
         else:  # minute
-            minutes_since_midnight = end_pst.hour * 60 + end_pst.minute
+            minutes_offset = end_pst.hour * 60 + end_pst.minute
         
-        # Format: sensor/interval/YYYY-MM-DD_DDDD_MMMM.png
-        return f"{sensor}/{interval}/{end_pst.strftime('%Y-%m-%d')}_{days_since_start:04d}_{minutes_since_midnight:04d}.png"
+        return (
+            f"{sensor}/{interval}/"
+            f"{end_pst.strftime('%Y-%m-%d')}_{day_diff:04d}_{minutes_offset:04d}.png"
+        )
 
     def get_kv_key(self, sensor: str, interval: str) -> str:
-        """Generate the KV key for storing the latest image path."""
         return f"latest_{sensor}_{interval}"
 
-    async def _save_image(self, image: object, path: Path) -> None:
-        """Save a single image to R2."""
-        try:
-            # Convert image to bytes
-            img_bytes = io.BytesIO()
-            image.save(img_bytes, format='PNG', optimize=True, compress_level=6)
-            img_bytes = img_bytes.getvalue()
-            
-            def _save():
-                # Upload to R2 only
-                r2_url = self.cloudflare.upload_image(img_bytes, str(path))
-                return r2_url
-            
-            r2_url = await asyncio.get_event_loop().run_in_executor(
-                self.thread_pool,
-                _save
-            )
-            
-            await self.async_logger.log(logging.DEBUG, f"Successfully saved image to R2: {r2_url}")
-            return r2_url
-        except Exception as e:
-            await self.async_logger.log(logging.ERROR, f"Error saving image: {str(e)}")
-            raise
+    async def _save_image(self, image, path: Path) -> str:
+        """
+        Saves a Pillow image to R2 using cloudflare_service.py
+        """
+        buf = io.BytesIO()
+        image.save(buf, format='PNG', optimize=True, compress_level=6)
+        data_bytes = buf.getvalue()
+
+        def do_upload():
+            return self.cloudflare.upload_image(data_bytes, str(path))
+        
+        r2_url = await asyncio.get_event_loop().run_in_executor(self.thread_pool, do_upload)
+        await self.async_logger.log(logging.DEBUG, f"Saved image to R2: {r2_url}")
+        return r2_url
 
     async def _update_kv_records(self, interval: str, sensor_status: Dict):
-        """Update KV records for all sensors after a batch completes.
-        Stores detailed information about the last processed state.
         """
-        try:
-            for sensor in self.sensors:
-                if sensor['column'] in sensor_status and sensor_status[sensor['column']].get('image_path'):
-                    kv_key = self.get_kv_key(sensor['column'], interval)
-                    # Store detailed information about the processed state
-                    kv_data = {
-                        'path': sensor_status[sensor['column']]['image_path'],
-                        'last_processed': datetime.now(timezone.utc).isoformat(),
-                        'last_success': sensor_status[sensor['column']].get('last_success'),
-                        'last_error': sensor_status[sensor['column']].get('last_error'),
-                        'status': 'success' if not sensor_status[sensor['column']].get('last_error') else 'error'
-                    }
-                    # Pass the dictionary directly to update_kv_record - it will handle the JSON encoding
-                    self.cloudflare.update_kv_record(kv_key, kv_data)
-                    await self.async_logger.log(
-                        logging.INFO,
-                        f"Updated KV record for {sensor['column']} {interval} with status {kv_data['status']}"
-                    )
-        except Exception as e:
-            await self.async_logger.log(logging.ERROR, f"Error updating KV records: {str(e)}")
-            # Don't raise the exception - we want to continue processing even if KV update fails
-            # The next run will detect the inconsistency and handle it appropriately
+        After generating images, update each sensor's KV record if it's newer than existing.
+        """
+        for s in self.sensors:
+            col = s['column']
+            if col not in sensor_status or not sensor_status[col].get('image_path'):
+                continue
+            
+            kv_key = self.get_kv_key(col, interval)
+            new_path = sensor_status[col]['image_path']
+            new_end_time = await self._extract_end_time_from_path(new_path, interval)
+
+            old_val = self.cloudflare.get_kv_record(kv_key)
+            if old_val:
+                try:
+                    outer_data = json.loads(old_val)
+                    if isinstance(outer_data, dict) and 'value' in outer_data:
+                        poss_val = outer_data['value']
+                        old_data = (
+                            poss_val if isinstance(poss_val, dict)
+                            else json.loads(poss_val)
+                        )
+                    else:
+                        old_data = outer_data if isinstance(outer_data, dict) else {}
+                    old_path = old_data.get('path')
+                    if old_path:
+                        old_end = await self._extract_end_time_from_path(old_path, interval)
+                        if old_end and new_end_time and new_end_time < old_end:
+                            await self.async_logger.log(logging.DEBUG,
+                                f"Skipping KV update for {kv_key}; old record is newer."
+                            )
+                            continue
+                except Exception as e:
+                    await self.async_logger.log(logging.WARNING, f"Error parsing old KV for {kv_key}: {e}")
+            
+            kv_data = {
+                'path': new_path,
+                'last_processed': datetime.now(timezone.utc).isoformat(),
+                'last_success': sensor_status[col].get('last_success'),
+                'last_error': sensor_status[col].get('last_error'),
+                'status': 'success' if not sensor_status[col].get('last_error') else 'error'
+            }
+            self.cloudflare.update_kv_record(kv_key, kv_data)
+            await self.async_logger.log(logging.INFO, f"Updated KV record: {kv_key} => {new_path}")
 
     async def process_sensor_update(
         self,
-        sensor: Dict[str, str],
+        sensor: Dict[str,str],
         start_time: datetime,
         end_time: datetime,
-        sensor_status: Dict,
+        sensor_status: Dict[str, dict],
         interval: str,
-        existing_data: Optional[List] = None
+        existing_data: Optional[List[EnvironmentalData]] = None
     ):
-        """Process a single sensor update with immediate saving."""
+        """Generate a single sensor's visualization for the given interval."""
         try:
-            # Use existing data if provided, otherwise fetch from database
+            col = sensor['column']
             data = existing_data if existing_data is not None else await self.data_service.get_sensor_data(
-                sensor['column'],
+                col,
                 start_date=start_time.astimezone(timezone.utc),
                 end_date=end_time.astimezone(timezone.utc)
             )
+            if not data:
+                await self.async_logger.log(logging.WARNING,
+                    f"No data for {col} from {start_time} to {end_time}"
+                )
+                return
             
-            if data:
-                start_pst = convert_to_pst(start_time)
-                end_pst = convert_to_pst(end_time)
-                
-                # Generate visualization
-                image = self.generator.generate_visualization(
-                    data=data,
-                    column=sensor['column'],
-                    color_scheme=sensor['color_scheme'],
-                    start_time=start_pst,
-                    end_time=end_pst,
-                    interval=interval
-                )
-                
-                # Generate R2 key and save image
-                r2_key = self.get_r2_key(sensor['column'], start_pst, end_pst, interval)
-                await self._save_image(image, Path(r2_key))
-                
-                # Update status
-                sensor_status[sensor['column']] = {
-                    'last_success': end_pst.isoformat(),
-                    'last_error': None,
-                    'image_path': r2_key
-                }
-                
-                # Explicitly cleanup
-                del image
-                if existing_data is None:  # Only delete if we fetched it
-                    del data
-            else:
-                await self.async_logger.log(
-                    logging.WARNING,
-                    f"No data available for {sensor['column']} between {start_time} and {end_time}"
-                )
-        except Exception as e:
-            await self.async_logger.log(
-                logging.ERROR,
-                f"Error processing {sensor['column']}: {str(e)}"
+            start_pst = convert_to_pst(start_time)
+            end_pst = convert_to_pst(end_time)
+            image = self.generator.generate_visualization(
+                data=data,
+                column=col,
+                color_scheme=sensor["color_scheme"],
+                start_time=start_pst,
+                end_time=end_pst,
+                interval=interval
             )
-            sensor_status[sensor['column']]['last_error'] = str(e)
+            
+            r2_key = self.get_r2_key(col, start_time, end_time, interval)
+            await self._save_image(image, Path(r2_key))
+            
+            sensor_status[col] = {
+                'last_success': end_pst.isoformat(),
+                'last_error': None,
+                'image_path': r2_key
+            }
+            
+            del image
+            if existing_data is None:
+                del data
+
+        except Exception as e:
+            col = sensor["column"]
+            await self.async_logger.log(logging.ERROR, f"Error processing {col}: {e}")
+            sensor_status[col]["last_error"] = str(e)
 
     async def process_interval_updates(
         self,
         start_date: datetime,
         end_date: datetime,
-        sensor_status: Dict,
+        sensor_status: Dict[str,dict],
         interval: str,
-        existing_data: Optional[Dict] = None
+        existing_data: Optional[Dict[str, List[EnvironmentalData]]] = None
     ):
-        """Process updates for a specific interval with optimized processing."""
-        try:
-            start_pst = convert_to_pst(start_date)
-            end_pst = convert_to_pst(end_date)
-            
-            await self.async_logger.log(logging.INFO, f"Processing {interval} updates from {start_pst} to {end_pst}")
-            
-            # Use existing data if provided, otherwise fetch new data
+        """
+        For daily/hourly, we do normal chunking.
+        For minute, we do a single big "cumulative" fetch from earliest to end_date,
+        then produce exactly one image that includes everything.
+        """
+        start_pst = convert_to_pst(start_date)
+        end_pst = convert_to_pst(end_date)
+        await self.async_logger.log(logging.INFO, f"Processing {interval} from {start_pst} to {end_pst}")
+
+        if interval in ("daily","hourly"):
+            # old chunk logic
             sensor_data = existing_data or {}
             if not existing_data:
-                # For minute visualizations, we need all historical data from the first data point
-                if interval == 'minute':
-                    first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
-                    if first_data:
-                        historical_start = convert_to_pst(first_data[0].time)
-                        data_futures = [
-                            self.data_service.get_sensor_data(
-                                sensor['column'],
-                                start_date=historical_start.astimezone(timezone.utc),
-                                end_date=end_date.astimezone(timezone.utc)
-                            )
-                            for sensor in self.sensors
-                        ]
-                else:
-                    data_futures = [
+                tasks = []
+                for s in self.sensors:
+                    col = s["column"]
+                    tasks.append(
                         self.data_service.get_sensor_data(
-                            sensor['column'],
+                            col,
                             start_date=start_date.astimezone(timezone.utc),
                             end_date=end_date.astimezone(timezone.utc)
                         )
-                        for sensor in self.sensors
-                    ]
-                all_sensor_data = await asyncio.gather(*data_futures)
+                    )
+                results = await asyncio.gather(*tasks)
                 sensor_data = {
-                    sensor['column']: data
-                    for sensor, data in zip(self.sensors, all_sensor_data)
-                    if data
+                    s['column']: r
+                    for s,r in zip(self.sensors, results)
+                    if r
                 }
             
             if not sensor_data:
-                await self.async_logger.log(logging.WARNING, f"No data found for {interval} updates")
+                await self.async_logger.log(logging.WARNING,
+                    f"No data found for {interval} from {start_date} to {end_date}"
+                )
                 return
             
-            # Calculate time step based on interval and config
-            if interval == 'minute':
-                chunk_interval = self.config.get('minute_chunk_interval', 'minute')
-                if chunk_interval == 'daily':
-                    # For daily chunks, start from midnight and increment by days
-                    current = start_pst.replace(hour=0, minute=0, second=0, microsecond=0)
-                    time_delta = timedelta(days=1)
-                elif chunk_interval == 'hourly':
-                    # For hourly chunks, start from the hour and increment by hours
-                    current = start_pst.replace(minute=0, second=0, microsecond=0)
-                    time_delta = timedelta(hours=1)
-                elif chunk_interval == 'weekly':
-                    # For weekly chunks, start from Monday midnight and increment by weeks
-                    current = start_pst.replace(hour=0, minute=0, second=0, microsecond=0)
-                    current = current - timedelta(days=current.weekday())  # Go back to Monday
-                    time_delta = timedelta(weeks=1)
-                else:  # minute or invalid value
-                    current = start_pst
-                    time_delta = timedelta(minutes=1)
-            else:
-                current = start_pst
-                time_delta = timedelta(days=1) if interval == 'daily' else \
-                           timedelta(hours=1) if interval == 'hourly' else \
-                           timedelta(minutes=1)
-                           
-            total_updates = int((end_pst - current) / time_delta) * len(self.sensors)
+            # chunk for daily or hourly
+            if interval == 'daily':
+                step = timedelta(days=1)
+                current = start_pst.replace(hour=0, minute=0)
+            else:  # hourly
+                step = timedelta(hours=1)
+                current = start_pst.replace(minute=0)
             
-            progress = ProgressManager(total_updates, f"Generating {interval} visualizations")
-            async with progress.progress_bar() as pbar:
+            total = max(0, int((end_pst - current)/step)) * len(self.sensors)
+            pm = ProgressManager(total, f"Generating {interval} visuals")
+            async with pm.progress_bar() as pbar:
                 while current < end_pst:
-                    next_time = min(current + time_delta, end_pst)
+                    next_time = min(current + step, end_pst)
                     
-                    # Process each sensor
-                    update_futures = []
-                    for sensor in self.sensors:
-                        if sensor['column'] in sensor_data:
-                            # For minute visualizations, incrementally build up data
-                            if interval == 'minute':
-                                # Filter data up to the current time
-                                current_data = [
-                                    point for point in sensor_data[sensor['column']]
-                                    if convert_to_pst(point.time) <= next_time
-                                ]
-                                if current_data:
-                                    historical_start = convert_to_pst(current_data[0].time)
-                                    update_futures.append(
-                                        self.process_sensor_update(
-                                            sensor,
-                                            historical_start,
-                                            next_time,
-                                            sensor_status,
-                                            interval,
-                                            current_data  # Pass incrementally built data
-                                        )
-                                    )
-                            else:
-                                update_futures.append(
-                                    self.process_sensor_update(
-                                        sensor,
-                                        current,
-                                        next_time,
-                                        sensor_status,
-                                        interval
-                                    )
+                    futs = []
+                    for s in self.sensors:
+                        col = s["column"]
+                        if col not in sensor_data:
+                            continue
+                        # filter for [current, next_time]
+                        subset = [
+                            x for x in sensor_data[col]
+                            if current <= convert_to_pst(x.time) <= next_time
+                        ]
+                        if subset:
+                            earliest = subset[0].time
+                            latest = subset[-1].time
+                            futs.append(
+                                self.process_sensor_update(
+                                    s,
+                                    earliest,
+                                    latest,
+                                    sensor_status,
+                                    interval,
+                                    existing_data=subset
                                 )
+                            )
                         pbar.update(1)
                     
-                    # Wait for all sensor updates to complete
-                    if update_futures:
-                        await asyncio.gather(*update_futures)
+                    if futs:
+                        await asyncio.gather(*futs)
                     
                     current = next_time
-                
-                # Update KV records only once after all processing is complete
-                await self._update_kv_records(interval, sensor_status)
-                
-                await self.async_logger.log(logging.INFO, f"Completed {interval} updates")
-                
-        except Exception as e:
-            await self.async_logger.log(logging.ERROR, f"Error processing {interval} updates: {str(e)}")
-            raise
 
-    # Replace existing process methods with optimized versions
-    async def process_daily_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict):
-        """Process daily updates."""
+            await self._update_kv_records(interval, sensor_status)
+            await self.async_logger.log(logging.INFO,
+                f"Completed {interval} updates"
+            )
+
+        else:
+            # minute => single "all time" approach
+            # 1) get earliest data from DB for each sensor
+            tasks = []
+            for s in self.sensors:
+                earliest_data = await self.data_service.get_sensor_data(
+                    s["column"], limit=1
+                )
+                if earliest_data:
+                    earliest_time = earliest_data[0].time
+                    # if earliest_time is after end_date => skip
+                    if earliest_time <= end_date:
+                        tasks.append(
+                            self.data_service.get_sensor_data(
+                                s["column"],
+                                start_date=earliest_time,
+                                end_date=end_date.astimezone(timezone.utc)
+                            )
+                        )
+                    else:
+                        tasks.append(None)
+                else:
+                    tasks.append(None)
+            
+            results = await asyncio.gather(*tasks)
+            
+            # match them up
+            sensor_data = {}
+            i=0
+            for s in self.sensors:
+                col = s["column"]
+                # results[i] might be None
+                if i < len(results) and results[i]:
+                    sensor_data[col] = results[i]
+                i+=1
+            
+            if not sensor_data:
+                await self.async_logger.log(logging.WARNING,
+                    f"No data found for minute interval up to {end_date}"
+                )
+                return
+            
+            # produce exactly ONE big minute image for each sensor, from earliest->end
+            # so each sensor has earliest_data[0].time => end_date
+            # We'll process them as a "batch" so we get a one-liner progress
+            total = len(self.sensors)
+            pm = ProgressManager(total, "Generating minute cumulative visuals")
+            async with pm.progress_bar() as pbar:
+                futs = []
+                for s in self.sensors:
+                    col = s["column"]
+                    if col not in sensor_data:
+                        pbar.update(1)
+                        continue
+                    all_data = sensor_data[col]
+                    # earliest & latest from the entire dataset
+                    earliest = all_data[0].time
+                    latest   = all_data[-1].time
+                    futs.append(
+                        self.process_sensor_update(
+                            s,
+                            earliest,
+                            latest,
+                            sensor_status,
+                            'minute',
+                            existing_data=all_data
+                        )
+                    )
+                    pbar.update(1)
+                
+                if futs:
+                    await asyncio.gather(*futs)
+
+            await self._update_kv_records('minute', sensor_status)
+            await self.async_logger.log(logging.INFO,
+                "Completed minute (cumulative) updates"
+            )
+
+    async def process_daily_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict[str, dict]):
         await self.process_interval_updates(start_date, end_date, sensor_status, 'daily')
 
-    async def process_hourly_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict):
-        """Process hourly updates."""
+    async def process_hourly_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict[str, dict]):
         await self.process_interval_updates(start_date, end_date, sensor_status, 'hourly')
 
-    async def process_minute_updates(
-        self,
-        start_date: datetime,
-        end_date: datetime,
-        sensor_status: Dict,
-        existing_data: Optional[Dict] = None
-    ):
-        """Process minute updates."""
+    async def process_minute_updates(self, start_date: datetime, end_date: datetime, sensor_status: Dict[str, dict], existing_data: Optional[Dict]=None):
         await self.process_interval_updates(start_date, end_date, sensor_status, 'minute', existing_data)
 
     async def generate_visualization(
@@ -509,20 +515,18 @@ class VisualizationService:
         end_time: datetime,
         color_scheme: str = 'base'
     ) -> Optional[Path]:
-        """Generate a visualization for a specific time range."""
+        """
+        A quick method to produce a single PNG for [start_time, end_time].
+        """
         try:
-            # Convert to PST for visualization boundaries
-            start_pst = convert_to_pst(start_time)
-            end_pst = convert_to_pst(end_time)
-            
-            # Get data from service
             data = await self.data_service.get_sensor_data(
                 sensor,
                 start_date=start_time.astimezone(timezone.utc),
                 end_date=end_time.astimezone(timezone.utc)
             )
-            
             if data:
+                start_pst = convert_to_pst(start_time)
+                end_pst   = convert_to_pst(end_time)
                 image = self.generator.generate_visualization(
                     data=data,
                     column=sensor,
@@ -530,539 +534,364 @@ class VisualizationService:
                     start_time=start_pst,
                     end_time=end_pst
                 )
-                
-                # Save and return image path
-                image_path = self.get_image_path(sensor, start_pst, end_pst)
-                image.save(image_path)
-                return image_path
-            
-            logger.warning(f"No data found for {sensor} between {start_time} and {end_time}")
-            return None
-            
+                # save locally
+                out_name = f"{sensor}_{start_pst:%Y%m%d_%H%M}_{end_pst:%Y%m%d_%H%M}.png"
+                out_path = self.output_dir / out_name
+                image.save(out_path)
+                return out_path
+            else:
+                logger.warning(f"No data found for {sensor} from {start_time} to {end_time}")
         except Exception as e:
-            logger.error(f"Error generating visualization for {sensor}: {str(e)}")
+            logger.error(f"Error generating single visualization for {sensor}: {e}")
             raise
-            
+        return None
+
     async def _find_latest_image(self, sensor: str, interval: str) -> Optional[Tuple[datetime, datetime]]:
-        """Find the latest image for a given sensor and interval type.
-        Returns a tuple of (start_time, end_time) in PST timezone if found, None otherwise.
+        """
+        Tries to parse the last known record from KV, returning (start_time, end_time).
         """
         try:
-            # Get the KV record for this sensor/interval
             kv_key = self.get_kv_key(sensor, interval)
-            kv_value = self.cloudflare.get_kv_record(kv_key)
-            
-            if not kv_value:
+            val = self.cloudflare.get_kv_record(kv_key)
+            if not val:
                 return None
-                
-            # Parse the JSON response - handle double encoding
-            try:
-                outer_data = json.loads(kv_value)
-                # Handle KV API response format which includes a 'value' field
-                if isinstance(outer_data, dict) and 'value' in outer_data:
-                    kv_value = outer_data['value']
-                
-                kv_data = json.loads(kv_value)
-                # Handle both old format (string path) and new format (JSON object)
-                if isinstance(kv_data, dict):
-                    path = kv_data.get('path')
-                    # If we have last_processed time, use that directly
-                    if kv_data.get('last_processed'):
-                        try:
-                            last_processed = datetime.fromisoformat(kv_data['last_processed'])
-                            # Convert to PST for consistency
-                            return None, convert_to_pst(last_processed)
-                        except (ValueError, TypeError):
-                            # If timestamp parsing fails, fall back to path parsing
-                            pass
-                else:
-                    path = kv_value
-                
-                if not path:
-                    return None
-                    
-                # Check if the record indicates an error state
-                if isinstance(kv_data, dict) and kv_data.get('status') == 'error':
-                    await self.async_logger.log(
-                        logging.WARNING,
-                        f"Found error state in KV for {sensor} {interval}. Will reprocess."
-                    )
-                    return None
-                    
-            except json.JSONDecodeError:
-                # If not JSON, assume the value is the path directly (old format)
-                path = kv_value
             
-            # Parse the filename to get the date and minutes
-            # Format: sensor/interval/YYYY-MM-DD_DDDD_MMMM.png
-            try:
-                parts = path.split('/')
-                if len(parts) != 3:
-                    return None
-                    
-                date_parts = parts[2].split('_')
-                if len(date_parts) != 3:
-                    return None
-                    
-                base_date = datetime.strptime(date_parts[0], '%Y-%m-%d')
-                days_offset = int(date_parts[1])
-                minutes_offset = int(date_parts[2].split('.')[0])
-                
-                # Convert to PST timezone
-                base_date = base_date.replace(tzinfo=ZoneInfo('America/Los_Angeles'))
-                
-                # Calculate end time
-                end_time = base_date
-                if interval == 'daily':
-                    end_time = end_time.replace(hour=23, minute=59)
-                elif interval == 'hourly':
-                    end_time = end_time.replace(hour=minutes_offset // 60, minute=59)
-                else:  # minute
-                    end_time = end_time.replace(hour=minutes_offset // 60, minute=minutes_offset % 60)
-                
-                # Calculate start time based on interval
-                if interval == 'daily':
-                    start_time = end_time.replace(hour=0, minute=0)
-                elif interval == 'hourly':
-                    start_time = end_time.replace(minute=0)
-                else:  # minute
-                    start_time = end_time
-                
-                # Adjust for days offset
-                end_time = end_time - timedelta(days=days_offset)
-                start_time = start_time - timedelta(days=days_offset)
-                
-                return start_time, end_time
-                
-            except (ValueError, IndexError) as e:
-                await self.async_logger.log(
-                    logging.ERROR,
-                    f"Error parsing image path {path} for {sensor} {interval}: {str(e)}"
+            outer_data = json.loads(val)
+            if isinstance(outer_data, dict) and 'value' in outer_data:
+                poss_val = outer_data['value']
+                kv_data = poss_val if isinstance(poss_val, dict) else json.loads(poss_val)
+            else:
+                kv_data = outer_data if isinstance(outer_data, dict) else {}
+            
+            if kv_data.get('status') == 'error':
+                await self.async_logger.log(logging.WARNING,
+                    f"{sensor} {interval} is in error state, ignoring."
                 )
                 return None
-                
+            
+            path = kv_data.get('path')
+            if not path:
+                return None
+            end_time = await self._extract_end_time_from_path(path, interval)
+            if not end_time:
+                return None
+            
+            if interval == 'daily':
+                start_time = end_time.replace(hour=0, minute=0)
+            elif interval == 'hourly':
+                start_time = end_time.replace(minute=0)
+            else:
+                start_time = end_time
+            return (start_time, end_time)
         except Exception as e:
-            await self.async_logger.log(
-                logging.ERROR,
-                f"Error finding latest image for {sensor} {interval}: {str(e)}"
-            )
+            await self.async_logger.log(logging.ERROR, f"Error reading KV for {sensor}/{interval}: {e}")
+            return None
+
+    async def _extract_end_time_from_path(self, path: str, interval: str) -> Optional[datetime]:
+        """
+        Ignores days_offset; only uses final minutes_offset for daily/hourly/minute.
+        e.g. "2025-01-15_0000_1439.png" => base_date=2025-01-15, minutes=1439 => 23:59
+        """
+        try:
+            parts = path.split('/')
+            if len(parts) != 3:
+                return None
+            
+            filename = parts[2].replace('.png','')
+            date_str, ignored_days, mins_str = filename.split('_')
+            
+            base_date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=ZoneInfo('America/Los_Angeles'))
+            val = int(mins_str)
+            
+            if interval == 'daily':
+                # 1439 => 23:59
+                return base_date.replace(hour=23, minute=59)
+            elif interval == 'hourly':
+                # e.g. 719 => 11:59
+                hour_ = val // 60
+                return base_date.replace(hour=hour_, minute=59)
+            else:
+                # minute => 611 => 10:11
+                hour_ = val // 60
+                minute_ = val % 60
+                return base_date.replace(hour=hour_, minute=minute_)
+        except Exception:
             return None
 
     async def backfill(self):
-        """Backfill visualizations from last stored image to current time."""
+        """One-time catch up on daily/hourly/minute intervals."""
         await self.async_logger.log(logging.INFO, "Starting backfill process")
-        
         try:
-            now = datetime.now(timezone.utc)
-            now_pst = convert_to_pst(now)
-            today_midnight_pst = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
+            now_utc = datetime.now(timezone.utc)
+            now_pst = convert_to_pst(now_utc)
+            midnight = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
             
             first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
             if not first_data:
-                await self.async_logger.log(logging.WARNING, "No data found")
+                await self.async_logger.log(logging.WARNING, "No data in DB.")
                 return
             
-            first_point_time = first_data[0].time
-            first_point_pst = convert_to_pst(first_point_time)
+            first_point = first_data[0].time
+            first_point_pst = convert_to_pst(first_point)
             
             await self.async_logger.log(logging.INFO, f"First data point: {first_point_pst.isoformat()}")
             await self.async_logger.log(logging.INFO, f"Current time: {now_pst.isoformat()}")
             
-            # Find latest images for each sensor and interval
-            latest_times = {}
-            for sensor in self.sensors:
-                latest_times[sensor['column']] = {
-                    interval: await self._find_latest_image(sensor['column'], interval)
-                    for interval in ['daily', 'hourly', 'minute']
-                }
-                
-                # Log the latest times found
-                await self.async_logger.log(logging.INFO, f"Latest images for {sensor['column']}:")
-                for interval, times in latest_times[sensor['column']].items():
-                    if times:
-                        await self.async_logger.log(logging.INFO, f"  - {interval}: {times[0].isoformat()} to {times[1].isoformat()}")
-                    else:
-                        await self.async_logger.log(logging.INFO, f"  - {interval}: No existing images")
+            # read existing images
+            latest_map = {}
+            for s in self.sensors:
+                c = s['column']
+                latest_map[c] = {}
+                for iv in ['daily','hourly','minute']:
+                    pair = await self._find_latest_image(c, iv)
+                    latest_map[c][iv] = pair
             
-            # Initialize start dates based on latest images or first data point
+            # default starts
             start_dates = {
                 'daily': first_point_pst.replace(hour=0, minute=0, second=0, microsecond=0),
                 'hourly': first_point_pst.replace(minute=0, second=0, microsecond=0),
                 'minute': first_point_pst
             }
+            # incorporate last known images
+            for s in self.sensors:
+                c = s['column']
+                for iv in ['daily','hourly','minute']:
+                    pair = latest_map[c][iv]
+                    if pair:
+                        _, end_t = pair
+                        if iv == 'daily':
+                            next_start = end_t.replace(hour=0, minute=0) + timedelta(days=1)
+                        elif iv == 'hourly':
+                            next_start = end_t.replace(minute=0) + timedelta(hours=1)
+                        else:
+                            next_start = end_t + timedelta(minutes=1)
+                        start_dates[iv] = max(start_dates[iv], next_start)
             
-            # Update start dates based on latest images
-            for sensor in self.sensors:
-                for interval in ['daily', 'hourly', 'minute']:
-                    latest = latest_times[sensor['column']][interval]
-                    if latest:
-                        _, end_time = latest
-                        if interval == 'daily':
-                            next_start = end_time.replace(hour=0, minute=0) + timedelta(days=1)
-                        elif interval == 'hourly':
-                            next_start = end_time.replace(minute=0) + timedelta(hours=1)
-                        else:  # minute
-                            next_start = end_time + timedelta(minutes=1)
-                        
-                        start_dates[interval] = max(start_dates[interval], next_start)
+            # do it
+            sensor_status = {s['column']: {'last_success': None,'last_error':None} for s in self.sensors}
             
-            await self.async_logger.log(logging.INFO, "Calculated start dates:")
-            for interval, start_date in start_dates.items():
-                await self.async_logger.log(logging.INFO, f"  - {interval}: {start_date.isoformat()}")
-            
-            sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-            
-            # Process daily visualizations
-            if start_dates['daily'] < today_midnight_pst:
+            if start_dates['daily'] < midnight:
                 await self.async_logger.log(logging.INFO, "=== Starting Daily Processing ===")
-                await self.process_daily_updates(start_dates['daily'], today_midnight_pst, sensor_status)
-                await self.async_logger.log(logging.INFO, "=== Daily Processing Complete ===")
+                await self.process_daily_updates(start_dates['daily'], midnight, sensor_status)
+                await self.async_logger.log(logging.INFO, "=== Daily done ===")
             
-            # Process hourly visualizations
             if start_dates['hourly'] < now_pst:
                 await self.async_logger.log(logging.INFO, "=== Starting Hourly Processing ===")
                 await self.process_hourly_updates(start_dates['hourly'], now_pst, sensor_status)
-                await self.async_logger.log(logging.INFO, "=== Hourly Processing Complete ===")
+                await self.async_logger.log(logging.INFO, "=== Hourly done ===")
             
-            # Process minute visualizations
             if start_dates['minute'] < now_pst:
                 await self.async_logger.log(logging.INFO, "=== Starting Minute Processing ===")
-                # Get all data for compound visualizations
-                compound_data = {}
-                for sensor in self.sensors:
-                    data = await self.data_service.get_sensor_data(
-                        sensor['column'],
-                        start_date=start_dates['minute'].astimezone(timezone.utc),
-                        end_date=now_pst.astimezone(timezone.utc)
-                    )
-                    if data:
-                        compound_data[sensor['column']] = data
-                        await self.async_logger.log(logging.INFO, f"Retrieved {len(data)} total data points for {sensor['column']}")
-                
+                # minute fetch
                 await self.process_minute_updates(
                     start_date=start_dates['minute'],
                     end_date=now_pst,
-                    sensor_status=sensor_status,
-                    existing_data=compound_data
+                    sensor_status=sensor_status
                 )
-                await self.async_logger.log(logging.INFO, "=== Minute Processing Complete ===")
+                await self.async_logger.log(logging.INFO, "=== Minute done ===")
             
             await self.async_logger.log(logging.INFO, "=== Backfill Complete ===")
-            
+
         except Exception as e:
             await self.async_logger.error("Error during backfill", exc_info=e)
             raise
 
     async def run(self):
-        """Run the visualization service."""
-        await self.async_logger.start()  # Start async logger
+        """
+        Once backfill is done, start daily/hourly/minute loops.
+        """
+        await self.async_logger.start()
         await self.async_logger.log(logging.INFO, "Starting visualization service...")
-        
         try:
-            # Initial backfill
             await self.backfill()
-            
             await self.async_logger.log(logging.INFO, "Starting continuous updates")
             
-            # Create tasks for each update frequency
             daily_task = asyncio.create_task(self._run_daily_updates())
-            hourly_task = asyncio.create_task(self._run_hourly_updates())
-            minute_task = asyncio.create_task(self._run_minute_updates())
+            hourly_task= asyncio.create_task(self._run_hourly_updates())
+            minute_task= asyncio.create_task(self._run_minute_updates())
             
-            # Wait for all tasks (they run indefinitely)
             await asyncio.gather(daily_task, hourly_task, minute_task)
-            
         finally:
-            await self.async_logger.stop()  # Ensure logger is stopped
-            
+            await self.async_logger.stop()
+
     async def _get_last_processed_time(self, interval: str) -> Optional[datetime]:
-        """Get the last processed time for a given interval from KV.
-        KV is treated as the source of truth for resumption.
         """
+        Read KV for each sensor's latest_{interval}, parse 'last_processed' or path. Return earliest among them.
+        """
+        earliest_time = None
+        missing = []
         try:
-            # Check each sensor's last processed time and return the earliest
-            earliest_time = None
-            latest_time = None
-            missing_sensors = []
-
-            for sensor in self.sensors:
-                kv_key = self.get_kv_key(sensor['column'], interval)
-                kv_value = self.cloudflare.get_kv_record(kv_key)
-                
-                if kv_value:
+            for s in self.sensors:
+                c = s['column']
+                kv_key = self.get_kv_key(c, interval)
+                kv_val = self.cloudflare.get_kv_record(kv_key)
+                if kv_val:
                     try:
-                        # Handle double-encoded JSON from KV
-                        outer_data = json.loads(kv_value)
-                        # Handle KV API response format which includes a 'value' field
+                        outer_data = json.loads(kv_val)
                         if isinstance(outer_data, dict) and 'value' in outer_data:
-                            kv_value = outer_data['value']
+                            outer_data = outer_data['value']
                         
-                        kv_data = json.loads(kv_value)
-                        if isinstance(kv_data, dict):
-                            # First try to get the last_processed timestamp
-                            if kv_data.get('last_processed'):
-                                try:
-                                    last_processed = datetime.fromisoformat(kv_data['last_processed'])
-                                    last_processed_pst = convert_to_pst(last_processed)
-                                    if earliest_time is None or last_processed_pst < earliest_time:
-                                        earliest_time = last_processed_pst
-                                    if latest_time is None or last_processed_pst > latest_time:
-                                        latest_time = last_processed_pst
-                                    continue  # Skip to next sensor if we successfully got timestamp
-                                except (ValueError, TypeError):
-                                    pass  # Fall through to path parsing if timestamp invalid
-                    except json.JSONDecodeError:
-                        pass  # Fall through to path parsing if not JSON
-                    
-                    # Fall back to parsing the path if we couldn't get timestamp
-                    times = await self._find_latest_image(sensor['column'], interval)
-                    if times:
-                        _, end_time = times  # We only care about the end time
-                        if earliest_time is None or end_time < earliest_time:
-                            earliest_time = end_time
-                        if latest_time is None or end_time > latest_time:
-                            latest_time = end_time
+                        kv_data = (
+                            outer_data if isinstance(outer_data, dict)
+                            else json.loads(outer_data)
+                        )
+                        if kv_data.get('last_processed'):
+                            dt = datetime.fromisoformat(kv_data['last_processed'])
+                            dt_pst = convert_to_pst(dt)
+                            if earliest_time is None or dt_pst < earliest_time:
+                                earliest_time = dt_pst
+                        else:
+                            # parse path
+                            p = kv_data.get('path')
+                            if p:
+                                e_time = await self._extract_end_time_from_path(p, interval)
+                                if e_time and (earliest_time is None or e_time < earliest_time):
+                                    earliest_time = e_time
+                    except Exception:
+                        pass
                 else:
-                    missing_sensors.append(sensor['column'])
-
-            if missing_sensors:
-                await self.async_logger.log(
-                    logging.INFO,
-                    f"No KV records found for sensors {', '.join(missing_sensors)} with interval {interval}. Will process from the beginning."
+                    missing.append(c)
+            
+            if missing:
+                await self.async_logger.log(logging.INFO, 
+                    f"No KV records found for sensors {', '.join(missing)} in {interval} interval"
                 )
                 return None
-            
-            if earliest_time and latest_time:
-                # If there's more than 2 intervals difference between earliest and latest,
-                # we should reprocess from the earliest to ensure consistency
-                interval_delta = self._get_interval_delta(interval)
-                if latest_time - earliest_time > interval_delta * 2:
-                    await self.async_logger.log(
-                        logging.WARNING,
-                        f"Large gap detected in {interval} processing times ({earliest_time} to {latest_time}). Will reprocess from {earliest_time}."
-                    )
-                return earliest_time
-            
-            return None
-            
         except Exception as e:
-            await self.async_logger.log(logging.ERROR, f"Error getting last processed time: {str(e)}")
+            await self.async_logger.log(logging.ERROR, f"Error in _get_last_processed_time({interval}): {e}")
             return None
-
-    def _get_interval_delta(self, interval: str) -> timedelta:
-        """Get the timedelta for a given interval type."""
-        if interval == 'daily':
-            return timedelta(days=1)
-        elif interval == 'hourly':
-            return timedelta(hours=1)
-        else:  # minute
-            return timedelta(minutes=1)
+        return earliest_time
 
     async def _run_daily_updates(self):
-        """Run daily updates at midnight PST."""
+        """Runs daily updates each midnight minus a small buffer."""
         while True:
             try:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
-                current_midnight = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
+                midn = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
                 
-                # Get last processed time
-                last_processed = await self._get_last_processed_time('daily')
-                if not last_processed:
-                    # If no last processed time, start from beginning of current day
-                    start_time = current_midnight
+                last_proc = await self._get_last_processed_time('daily')
+                if not last_proc:
+                    start_time = midn
                 else:
-                    # Ensure we don't process future data
-                    start_time = min(last_processed, now_pst)
-                    # Round down to midnight
-                    start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+                    start_time = last_proc.replace(hour=0, minute=0, second=0, microsecond=0)
                 
-                # Calculate next midnight
-                next_midnight = current_midnight + timedelta(days=1)
+                next_midn = midn + timedelta(days=1)
+                until = min(next_midn, now_pst - timedelta(minutes=5))
                 
-                # Only process if we have a full day's worth of data
-                process_until = min(next_midnight, now_pst - timedelta(minutes=5))
+                if start_time < until:
+                    st = {s['column']: {'last_success':None,'last_error':None} for s in self.sensors}
+                    await self.process_daily_updates(start_time, until, st)
+                    await self._update_kv_records('daily', st)
                 
-                if start_time < process_until:
-                    # Process daily updates
-                    sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-                    await self.process_daily_updates(start_time, process_until, sensor_status)
-                    # Update KV records
-                    await self._update_kv_records('daily', sensor_status)
-                
-                # Calculate wait time to next processing cycle
-                wait_seconds = max(0, (next_midnight - now_pst).total_seconds())
-                await self.async_logger.log(logging.INFO, f"Daily updates will run in {int(wait_seconds/3600)} hours")
-                await asyncio.sleep(wait_seconds)
-                
+                wait_secs = max(0,(next_midn - now_pst).total_seconds())
+                await self.async_logger.log(logging.INFO,f"Daily loop sleeps {int(wait_secs/3600)} h")
+                await asyncio.sleep(wait_secs)
             except Exception as e:
-                await self.async_logger.log(logging.ERROR, f"Error in daily update cycle: {str(e)}")
-                await asyncio.sleep(60)  # Wait a minute before retrying
+                await self.async_logger.log(logging.ERROR, f"Error in daily loop: {e}")
+                await asyncio.sleep(60)
 
     async def _run_hourly_updates(self):
-        """Run hourly updates at the start of each hour."""
+        """Runs hourly updates every hour on the hour, minus 5 minutes buffer."""
         while True:
             try:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
-                current_hour = now_pst.replace(minute=0, second=0, microsecond=0)
+                hr_top = now_pst.replace(minute=0, second=0, microsecond=0)
                 
-                # Get last processed time
-                last_processed = await self._get_last_processed_time('hourly')
-                if not last_processed:
-                    # If no last processed time, start from beginning of current hour
-                    start_time = current_hour
+                last_proc = await self._get_last_processed_time('hourly')
+                if not last_proc:
+                    start_time = hr_top
                 else:
-                    # Ensure we don't process future data
-                    start_time = min(last_processed, now_pst)
-                    # Round down to hour
-                    start_time = start_time.replace(minute=0, second=0, microsecond=0)
+                    start_time = last_proc.replace(minute=0, second=0, microsecond=0)
                 
-                # Calculate next hour
-                next_hour = current_hour + timedelta(hours=1)
+                next_hour = hr_top + timedelta(hours=1)
+                until = min(next_hour, now_pst - timedelta(minutes=5))
                 
-                # Only process if we have enough data (wait 5 minutes after the hour)
-                process_until = min(next_hour, now_pst - timedelta(minutes=5))
+                if start_time < until:
+                    st = {s['column']: {'last_success':None,'last_error':None} for s in self.sensors}
+                    await self.process_hourly_updates(start_time, until, st)
+                    await self._update_kv_records('hourly', st)
                 
-                if start_time < process_until:
-                    # Process hourly updates
-                    sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-                    await self.process_hourly_updates(start_time, process_until, sensor_status)
-                    # Update KV records
-                    await self._update_kv_records('hourly', sensor_status)
-                
-                # Calculate wait time to next processing cycle
-                wait_seconds = max(0, (next_hour - now_pst).total_seconds())
-                await self.async_logger.log(logging.INFO, f"Hourly updates will run in {int(wait_seconds/60)} minutes")
-                await asyncio.sleep(wait_seconds)
-                
+                wait_secs = max(0,(next_hour - now_pst).total_seconds())
+                await self.async_logger.log(logging.INFO,f"Hourly loop sleeps {int(wait_secs/60)} min")
+                await asyncio.sleep(wait_secs)
             except Exception as e:
-                await self.async_logger.log(logging.ERROR, f"Error in hourly update cycle: {str(e)}")
-                await asyncio.sleep(60)  # Wait a minute before retrying
+                await self.async_logger.log(logging.ERROR, f"Error in hourly loop: {e}")
+                await asyncio.sleep(60)
 
     async def _run_minute_updates(self):
-        """Run minute updates every 5 minutes."""
-        UPDATE_INTERVAL = timedelta(minutes=5)  # Update every 5 minutes
-        
+        """
+        For minute intervals, run every 5 minutes. We fetch from last known or 5 minutes prior,
+        then call `process_minute_updates` which does a SINGLE big all-time fetch and single image 
+        if you keep the code above. Or, if you prefer chunking, you'd revert it.
+        """
+        UPDATE_INTERVAL = timedelta(minutes=5)
         while True:
             try:
                 now = datetime.now(timezone.utc)
                 now_pst = convert_to_pst(now)
+                block_5 = (now_pst.minute // 5)*5
+                cur_time= now_pst.replace(minute=block_5, second=0, microsecond=0)
                 
-                # Round current time down to nearest 5 minutes
-                minutes = (now_pst.minute // 5) * 5
-                current_time = now_pst.replace(minute=minutes, second=0, microsecond=0)
-                
-                # Get last processed time
-                last_processed = await self._get_last_processed_time('minute')
-                if not last_processed:
-                    # If no last processed time, start from 5 minutes ago
-                    start_time = current_time - UPDATE_INTERVAL
+                last_proc = await self._get_last_processed_time('minute')
+                if not last_proc:
+                    start_time = cur_time - UPDATE_INTERVAL
                 else:
-                    # Ensure we don't process future data
-                    start_time = min(last_processed, now_pst)
-                    # Round down to nearest 5 minutes
-                    minutes = (start_time.minute // 5) * 5
-                    start_time = start_time.replace(minute=minutes, second=0, microsecond=0)
+                    st_5 = (last_proc.minute // 5)*5
+                    start_time = last_proc.replace(minute=st_5, second=0, microsecond=0)
                 
-                next_time = current_time + UPDATE_INTERVAL
+                nxt = cur_time + UPDATE_INTERVAL
+                until = min(nxt, now_pst - timedelta(seconds=30))
                 
-                # Only process if we have enough data (wait 30 seconds after the 5-minute mark)
-                process_until = min(next_time, now_pst - timedelta(seconds=30))
+                if start_time < until:
+                    st = {s['column']: {'last_success':None,'last_error':None} for s in self.sensors}
+                    await self.process_minute_updates(start_time, until, st)
+                    await self._update_kv_records('minute', st)
                 
-                if start_time < process_until:
-                    # Process minute updates
-                    sensor_status = {sensor['column']: {'last_success': None, 'last_error': None} for sensor in self.sensors}
-                    
-                    # Get all historical data for compound visualizations
-                    compound_data = {}
-                    first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
-                    
-                    if first_data:
-                        historical_start = convert_to_pst(first_data[0].time)
-                        
-                        # Fetch all historical data for each sensor
-                        for sensor in self.sensors:
-                            data = await self.data_service.get_sensor_data(
-                                sensor['column'],
-                                start_date=historical_start.astimezone(timezone.utc),
-                                end_date=process_until.astimezone(timezone.utc)
-                            )
-                            if data:
-                                compound_data[sensor['column']] = data
-                                await self.async_logger.log(
-                                    logging.DEBUG, 
-                                    f"Retrieved {len(data)} historical points for {sensor['column']} from {historical_start} to {process_until}"
-                                )
-                    
-                        await self.process_minute_updates(
-                            start_date=historical_start,
-                            end_date=process_until,
-                            sensor_status=sensor_status,
-                            existing_data=compound_data
-                        )
-                        
-                        # Update KV records
-                        await self._update_kv_records('minute', sensor_status)
-                    else:
-                        await self.async_logger.log(logging.WARNING, "No historical data found for minute updates")
-                
-                # Calculate wait time to next processing cycle
-                next_process_time = current_time + UPDATE_INTERVAL
-                wait_seconds = max(0, (next_process_time - now_pst).total_seconds())
-                await self.async_logger.log(logging.INFO, f"Minute updates will run in {int(wait_seconds)} seconds")
-                await asyncio.sleep(wait_seconds)
-                
+                wait_secs= max(0,(nxt - now_pst).total_seconds())
+                await self.async_logger.log(logging.INFO, f"Minute updates sleep {int(wait_secs)}s")
+                await asyncio.sleep(wait_secs)
             except Exception as e:
-                await self.async_logger.log(logging.ERROR, f"Error in minute update cycle: {str(e)}")
-                await asyncio.sleep(60)  # Wait a minute before retrying
+                await self.async_logger.log(logging.ERROR, f"Error in minute loop: {e}")
+                await asyncio.sleep(60)
 
 async def start_service(
     db_path: str = "data/environmental.db",
     output_dir: str = "data/visualizations",
     scale_factor: int = 4
 ):
-    """Start the visualization service."""
-    logging.info("Starting visualization service with configuration:")
-    logging.info(f"Database path: {db_path}")
-    logging.info(f"Output directory: {output_dir}")
+    logger.info("Starting visualization service with config:")
+    logger.info(f"DB path: {db_path}")
+    logger.info(f"Output dir: {output_dir}")
     
-    # Always sync with Supabase to ensure we have the latest data
     logger.info("Syncing data from Supabase...")
-    await migrate_data(
-        supabase_url=SUPABASE_URL,
-        supabase_key=SUPABASE_KEY,
-        db_path=db_path
-    )
+    await migrate_data(SUPABASE_URL, SUPABASE_KEY, db_path=db_path)
     logger.info("Data sync complete")
-    
+
     sensors = [
-        {'column': 'temperature', 'color_scheme': 'redblue'},
-        {'column': 'humidity', 'color_scheme': 'cyan'},
-        {'column': 'pressure', 'color_scheme': 'green'},
-        {'column': 'light', 'color_scheme': 'base'},
-        {'column': 'uv', 'color_scheme': 'purple'},
-        {'column': 'gas', 'color_scheme': 'green'}
+        {'column': 'temperature','color_scheme': 'redblue'},
+        {'column': 'humidity',   'color_scheme': 'cyan'},
+        {'column': 'pressure',   'color_scheme': 'green'},
+        {'column': 'light',      'color_scheme': 'base'},
+        {'column': 'uv',         'color_scheme': 'purple'},
+        {'column': 'gas',        'color_scheme': 'yellow'}
     ]
-    
+
     config = {
         'db_path': db_path,
         'output_dir': output_dir,
         'scale_factor': scale_factor,
-        'max_workers': None,  # None means use CPU count
-        'batch_size': 30,  # Number of images to process in parallel
-        'minute_chunk_interval': 'hourly'  # Interval for minute cumulative view - minute, hourly, daily, weekly
+        'max_workers': None,
+        'batch_size': 30,
+        # daily/hourly => chunked
+        # minute => single cumulative
+        'minute_chunk_interval': 'hourly'
     }
-    
-    service = VisualizationService(
-        sensors=sensors,
-        config=config
-    )
-    
-    # Initialize async components
-    await service.initialize()
-    
-    await service.run()
+
+    svc = VisualizationService(sensors, config)
+    await svc.initialize()
+    await svc.run()
 
 if __name__ == "__main__":
     asyncio.run(start_service())
