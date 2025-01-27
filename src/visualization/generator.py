@@ -25,7 +25,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 MINUTES_IN_DAY = 1440  # 1px per minute
-BASE_HEIGHT = 1825     # Fixed height for all visualizations
+BASE_HEIGHT = 1680     # Fixed height for all visualizations
 SCALE_FACTOR = 4      # Default scale factor for final output
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
