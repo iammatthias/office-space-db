@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import logging
 from zoneinfo import ZoneInfo
 from functools import partial
+import threading
 
 from .utils import EnvironmentalData, convert_to_pst
 from .sqlite_service import SQLiteService
@@ -26,7 +27,8 @@ class DataService:
     def __init__(self, db_path: str = "data/environmental.db", update_interval_minutes: int = 5):
         """Initialize the data service."""
         self.update_interval = timedelta(minutes=update_interval_minutes)
-        self.sqlite_service = SQLiteService(db_path)
+        self.db_path = db_path
+        self._sqlite_services = {}  # Thread-local SQLite services
         self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         self.column_map = {
             'temperature': 'temp',
@@ -44,10 +46,20 @@ class DataService:
         self._update_lock = asyncio.Lock()
         self._last_timestamp: Optional[datetime] = None
         
+    def _get_sqlite_service(self) -> SQLiteService:
+        """Get or create a thread-local SQLite service instance."""
+        thread_id = threading.get_ident()
+        if thread_id not in self._sqlite_services:
+            sqlite_service = SQLiteService(self.db_path)
+            self._sqlite_services[thread_id] = sqlite_service
+        return self._sqlite_services[thread_id]
+        
     async def initialize(self):
         """Initialize the data service by fetching all historical data."""
         logger.info("Initializing data service...")
-        await self.sqlite_service.initialize()
+        # Initialize SQLite service in the main thread
+        sqlite_service = self._get_sqlite_service()
+        await sqlite_service.initialize()
         await self._fetch_all_historical_data()
         logger.info("Data service initialized")
         
@@ -63,12 +75,14 @@ class DataService:
                 await asyncio.sleep(self.update_interval.total_seconds())
                 
                 # Get last timestamp from SQLite
-                last_timestamp = await self.sqlite_service.get_last_timestamp()
+                sqlite_service = self._get_sqlite_service()
+                await sqlite_service.initialize()  # Ensure initialized in this thread
+                last_timestamp = await sqlite_service.get_last_timestamp()
                 if last_timestamp:
                     # Sync new data from Supabase
                     synced_count = await sync_since_timestamp(
                         self.supabase,
-                        self.sqlite_service,
+                        sqlite_service,
                         last_timestamp
                     )
                     
@@ -84,10 +98,11 @@ class DataService:
         """Fetch all historical data from the database."""
         async with self._update_lock:
             total_points = 0
+            sqlite_service = self._get_sqlite_service()
             
             # Fetch data for each sensor
             for sensor in self.column_map.keys():
-                data = await self.sqlite_service.get_sensor_data(sensor)
+                data = await sqlite_service.get_sensor_data(sensor)
                 self._data[sensor] = [(point.time, point.value) for point in data]
                 total_points += len(data)
                 
@@ -99,7 +114,7 @@ class DataService:
             
             self._last_update = datetime.now(timezone.utc)
             logger.info(f"Fetched historical data: {total_points} total points across {len(self.column_map)} sensors")
-            
+                
     async def _fetch_new_data(self):
         """Fetch new data since last update."""
         if not self._last_timestamp:
@@ -108,10 +123,11 @@ class DataService:
             
         async with self._update_lock:
             new_points = 0
+            sqlite_service = self._get_sqlite_service()
             
             # Fetch new data for each sensor
             for sensor in self.column_map.keys():
-                data = await self.sqlite_service.get_sensor_data(
+                data = await sqlite_service.get_sensor_data(
                     sensor,
                     start_date=self._last_timestamp
                 )
@@ -177,35 +193,35 @@ class DataService:
             # Convert to EnvironmentalData objects
             parsed_data = [EnvironmentalData(dt, value) for dt, value in filtered_data]
             
-        # Fill minute-by-minute data if date range provided
-        if start_date and end_date and parsed_data:
-            start_pst = convert_to_pst(start_date)
-            end_pst = convert_to_pst(end_date)
-            current = start_pst.replace(second=0, microsecond=0)
+            # Fill minute-by-minute data if date range provided
+            if start_date and end_date and parsed_data:
+                start_pst = convert_to_pst(start_date)
+                end_pst = convert_to_pst(end_date)
+                current = start_pst.replace(second=0, microsecond=0)
+                
+                all_minutes = []
+                while current < end_pst:
+                    all_minutes.append(current)
+                    current += timedelta(minutes=1)
+                
+                minute_dict = {
+                    convert_to_pst(point.time).replace(second=0, microsecond=0): point.value
+                    for point in parsed_data
+                }
+                
+                valid_data = [
+                    EnvironmentalData(minute, minute_dict.get(minute, None))
+                    for minute in all_minutes
+                ]
+                
+                # Interpolate missing values
+                valid_data = self._interpolate_missing_values(valid_data)
+            else:
+                valid_data = parsed_data
             
-            all_minutes = []
-            while current < end_pst:
-                all_minutes.append(current)
-                current += timedelta(minutes=1)
+            logger.info(f"Retrieved {len(valid_data)} data points for {sensor}")
+            return valid_data
             
-            minute_dict = {
-                convert_to_pst(point.time).replace(second=0, microsecond=0): point.value
-                for point in parsed_data
-            }
-            
-            valid_data = [
-                EnvironmentalData(minute, minute_dict.get(minute, None))
-                for minute in all_minutes
-            ]
-            
-            # Interpolate missing values
-            valid_data = self._interpolate_missing_values(valid_data)
-        else:
-            valid_data = parsed_data
-        
-        logger.info(f"Retrieved {len(valid_data)} data points for {sensor}")
-        return valid_data
-        
     def _interpolate_missing_values(self, data: List[EnvironmentalData]) -> List[EnvironmentalData]:
         """Interpolate missing values in the data."""
         if not data:
@@ -258,15 +274,16 @@ class DataService:
                 
             # Get the earliest point from SQLite
             async with self._update_lock:
-                if not self.sqlite_service:
-                    await self.initialize()
+                sqlite_service = self._get_sqlite_service()
+                await sqlite_service.initialize()
                     
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
                     None,
                     partial(
                         self._get_earliest_data_point_sync,
-                        sensor
+                        sensor,
+                        sqlite_service
                     )
                 )
                 return result
@@ -274,11 +291,12 @@ class DataService:
             logger.error(f"Error getting earliest data point for {sensor}: {str(e)}")
             return None
             
-    def _get_earliest_data_point_sync(self, sensor: str) -> Optional[EnvironmentalData]:
+    def _get_earliest_data_point_sync(self, sensor: str, sqlite_service: SQLiteService) -> Optional[EnvironmentalData]:
         """Synchronous helper to get earliest data point."""
         try:
             db_column = self.column_map[sensor]
-            cursor = self.sqlite_service.conn.execute(
+            conn = sqlite_service._get_connection()
+            cursor = conn.execute(
                 f"SELECT time, {db_column} FROM environmental_data WHERE {db_column} IS NOT NULL ORDER BY time ASC LIMIT 1"
             )
             row = cursor.fetchone()

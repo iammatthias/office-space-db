@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional, Dict
 import asyncio
 from functools import partial
+import threading
 
 from .utils import EnvironmentalData
 
@@ -19,7 +20,7 @@ class SQLiteService:
         """Initialize the SQLite service."""
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = None
+        self._connections = {}  # Thread-local connections
         self.column_map = {
             'temperature': 'temp',
             'humidity': 'hum',
@@ -29,6 +30,17 @@ class SQLiteService:
             'gas': 'gas',
         }
         self._lock = asyncio.Lock()
+        
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get or create a thread-local database connection."""
+        thread_id = threading.get_ident()
+        if thread_id not in self._connections:
+            conn = sqlite3.connect(self.db_path, isolation_level=None)  # autocommit mode
+            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
+            conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes with reasonable safety
+            self._connections[thread_id] = conn
+            self._create_tables(conn)
+        return self._connections[thread_id]
         
     async def initialize(self):
         """Initialize the database and create tables if they don't exist."""
@@ -46,50 +58,41 @@ class SQLiteService:
             
     def _initialize_sync(self):
         """Synchronous initialization of database."""
-        if self.conn is None:
-            self.conn = sqlite3.connect(self.db_path, isolation_level=None)  # autocommit mode
-            self.conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
-            self.conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes with reasonable safety
-            self._create_tables()
+        # This will create a connection for the current thread if it doesn't exist
+        self._get_connection()
             
-    def _create_tables(self):
+    def _create_tables(self, conn: sqlite3.Connection):
         """Create the necessary tables if they don't exist."""
-        with self.conn:
-            self.conn.execute("""
+        columns = [f"{col} REAL" for col in self.column_map.values()]
+        columns = ["time TEXT NOT NULL"] + columns
+        
+        with conn:
+            conn.execute(
+                f"""
                 CREATE TABLE IF NOT EXISTS environmental_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    time TIMESTAMP NOT NULL,
-                    temp REAL,
-                    hum REAL,
-                    pressure REAL,
-                    lux REAL,
-                    uv REAL,
-                    gas REAL
+                    {', '.join(columns)},
+                    PRIMARY KEY (time)
                 )
-            """)
-            # Create an index on the time column for faster queries
-            self.conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_environmental_data_time 
-                ON environmental_data(time)
-            """)
+                """
+            )
             
     async def close(self):
-        """Close the database connection."""
-        if self.conn:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._close_sync)
+        """Close all database connections."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._close_sync)
             
     def _close_sync(self):
         """Synchronous database close."""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        for conn in self._connections.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._connections.clear()
             
     async def insert_data(self, data: Dict):
         """Insert a single row of data."""
         async with self._lock:
-            if not self.conn:
-                await self.initialize()
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
@@ -99,12 +102,13 @@ class SQLiteService:
             
     def _insert_data_sync(self, data: Dict):
         """Synchronous data insertion."""
+        conn = self._get_connection()
         columns = ['time'] + list(self.column_map.values())
         placeholders = ','.join(['?' for _ in columns])
         values = [data.get(col) for col in columns]
         
-        with self.conn:
-            self.conn.execute(
+        with conn:
+            conn.execute(
                 f"INSERT INTO environmental_data ({','.join(columns)}) VALUES ({placeholders})",
                 values
             )
@@ -115,8 +119,6 @@ class SQLiteService:
             return
             
         async with self._lock:
-            if not self.conn:
-                await self.initialize()
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
@@ -126,12 +128,13 @@ class SQLiteService:
             
     def _insert_many_sync(self, data_rows: List[Dict]):
         """Synchronous batch insertion."""
+        conn = self._get_connection()
         columns = ['time'] + list(self.column_map.values())
         placeholders = ','.join(['?' for _ in columns])
         values = [[row.get(col) for col in columns] for row in data_rows]
         
-        with self.conn:
-            self.conn.executemany(
+        with conn:
+            conn.executemany(
                 f"INSERT INTO environmental_data ({','.join(columns)}) VALUES ({placeholders})",
                 values
             )
@@ -148,8 +151,6 @@ class SQLiteService:
             raise ValueError(f"Unknown sensor type: {sensor}")
             
         async with self._lock:
-            if not self.conn:
-                await self.initialize()
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 None,
@@ -169,8 +170,10 @@ class SQLiteService:
         end_date: Optional[datetime] = None,
         limit: Optional[int] = None
     ) -> List[EnvironmentalData]:
-        """Synchronous data retrieval."""
+        """Synchronous helper to get sensor data."""
+        conn = self._get_connection()
         db_column = self.column_map[sensor]
+        
         query = f"SELECT time, {db_column} FROM environmental_data WHERE {db_column} IS NOT NULL"
         params = []
         
@@ -182,28 +185,25 @@ class SQLiteService:
             params.append(end_date.isoformat())
             
         query += " ORDER BY time ASC"
-        
         if limit:
             query += " LIMIT ?"
             params.append(limit)
             
-        with self.conn:
-            cursor = self.conn.execute(query, params)
+        with conn:
+            cursor = conn.execute(query, params)
             rows = cursor.fetchall()
             
         return [
             EnvironmentalData(
-                datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc),
-                row[1]
+                time=datetime.fromisoformat(time_str).replace(tzinfo=timezone.utc),
+                value=float(value)
             )
-            for row in rows
+            for time_str, value in rows
         ]
         
     async def get_first_timestamp(self) -> Optional[datetime]:
         """Get the timestamp of the first data point."""
         async with self._lock:
-            if not self.conn:
-                await self.initialize()
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 None,
@@ -212,8 +212,9 @@ class SQLiteService:
             
     def _get_first_timestamp_sync(self) -> Optional[datetime]:
         """Synchronous first timestamp retrieval."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT time FROM environmental_data ORDER BY time ASC LIMIT 1")
+        conn = self._get_connection()
+        with conn:
+            cursor = conn.execute("SELECT time FROM environmental_data ORDER BY time ASC LIMIT 1")
             row = cursor.fetchone()
             
         if row:
@@ -223,8 +224,6 @@ class SQLiteService:
     async def get_last_timestamp(self) -> Optional[datetime]:
         """Get the timestamp of the last data point."""
         async with self._lock:
-            if not self.conn:
-                await self.initialize()
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 None,
@@ -233,8 +232,9 @@ class SQLiteService:
             
     def _get_last_timestamp_sync(self) -> Optional[datetime]:
         """Synchronous last timestamp retrieval."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT time FROM environmental_data ORDER BY time DESC LIMIT 1")
+        conn = self._get_connection()
+        with conn:
+            cursor = conn.execute("SELECT time FROM environmental_data ORDER BY time DESC LIMIT 1")
             row = cursor.fetchone()
             
         if row:

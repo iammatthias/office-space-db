@@ -12,6 +12,7 @@ from pathlib import Path
 from tqdm.asyncio import tqdm
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 from .generator import VisualizationGenerator
 from .utils import EnvironmentalData, convert_to_pst
@@ -185,7 +186,8 @@ class VisualizationService:
         self.sensors = sensors
         self.config = config
         self.output_dir = Path(config['output_dir'])
-        self.data_service = DataService(config['db_path'])
+        self.db_path = config['db_path']
+        self._data_services = {}  # Thread-local DataService instances
         self.async_logger = AsyncLogger(logger)
         
         self.thread_pool = ThreadPoolExecutor(max_workers=config['max_workers'])
@@ -200,10 +202,20 @@ class VisualizationService:
         logger.info(f"- Batch size: {config.get('batch_size')}")
         logger.info(f"- Scale factor: {config.get('scale_factor')}")
 
+    def _get_data_service(self) -> DataService:
+        """Get or create a thread-local DataService instance."""
+        thread_id = threading.get_ident()
+        if thread_id not in self._data_services:
+            data_service = DataService(self.db_path)
+            self._data_services[thread_id] = data_service
+        return self._data_services[thread_id]
+
     async def initialize(self):
         """Sets up async services like the logger and database connections."""
         await self.async_logger.start()
-        await self.data_service.initialize()
+        # Initialize the main thread's DataService
+        data_service = self._get_data_service()
+        await data_service.initialize()
         logger.info("Initialized async components of visualization service")
 
     def get_r2_key(self, sensor: str, start_time: datetime, end_time: datetime, interval: str) -> str:
@@ -317,7 +329,8 @@ class VisualizationService:
         """
         try:
             col = sensor['column']
-            data = existing_data if existing_data is not None else await self.data_service.get_sensor_data(
+            data_service = self._get_data_service()
+            data = existing_data if existing_data is not None else await data_service.get_sensor_data(
                 col,
                 start_date=start_time.astimezone(timezone.utc),
                 end_date=end_time.astimezone(timezone.utc)
@@ -386,7 +399,7 @@ class VisualizationService:
                 for s in self.sensors:
                     col = s["column"]
                     tasks.append(
-                        self.data_service.get_sensor_data(
+                        self._get_data_service().get_sensor_data(
                             col,
                             start_date=start_date.astimezone(timezone.utc),
                             end_date=end_date.astimezone(timezone.utc)
@@ -454,7 +467,7 @@ class VisualizationService:
 
         else:
             # minute => day-by-day cumulative backfill
-            first_db_record = await self.data_service.get_sensor_data(self.sensors[0]["column"], limit=1)
+            first_db_record = await self._get_data_service().get_sensor_data(self.sensors[0]["column"], limit=1)
             if not first_db_record:
                 await self.async_logger.log(logging.WARNING, "No data in DB for minute interval.")
                 return
@@ -479,7 +492,7 @@ class VisualizationService:
                     for s in self.sensors:
                         col = s["column"]
                         tasks.append(
-                            self.data_service.get_sensor_data(
+                            self._get_data_service().get_sensor_data(
                                 col,
                                 start_date=earliest_db_time.astimezone(timezone.utc),
                                 end_date=day_end.astimezone(timezone.utc)
@@ -543,7 +556,7 @@ class VisualizationService:
         Convenience method to produce a single PNG for [start_time, end_time] locally.
         """
         try:
-            data = await self.data_service.get_sensor_data(
+            data = await self._get_data_service().get_sensor_data(
                 sensor,
                 start_date=start_time.astimezone(timezone.utc),
                 end_date=end_time.astimezone(timezone.utc)
@@ -657,7 +670,7 @@ class VisualizationService:
             now_pst = convert_to_pst(now_utc)
             midnight = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
             
-            first_data = await self.data_service.get_sensor_data(self.sensors[0]['column'], limit=1)
+            first_data = await self._get_data_service().get_sensor_data(self.sensors[0]['column'], limit=1)
             if not first_data:
                 await self.async_logger.log(logging.WARNING, "No data in DB.")
                 return
@@ -752,18 +765,20 @@ class VisualizationService:
         finally:
             await self.async_logger.stop()
 
-    async def _get_last_processed_time(self, interval: str) -> Optional[datetime]:
+    async def _get_last_processed_time(self, interval: str) -> Dict[str, Optional[datetime]]:
         """
         Check the KV store for each sensor's 'latest_{interval}' record, parse
-        'last_processed' or the path's end_time, and return the earliest among them.
+        'last_processed' or the path's end_time, and return a dict of sensor -> latest time.
+        If a sensor has no record or is in error state, its time will be None.
         """
-        earliest_time = None
-        missing = []
+        sensor_times = {}
         try:
             for s in self.sensors:
                 c = s['column']
                 kv_key = self.get_kv_key(c, interval)
                 kv_val = self.cloudflare.get_kv_record(kv_key)
+                sensor_times[c] = None
+                
                 if kv_val:
                     try:
                         outer_data = json.loads(kv_val)
@@ -774,38 +789,46 @@ class VisualizationService:
                             outer_data if isinstance(outer_data, dict)
                             else json.loads(outer_data)
                         )
+                        
+                        if kv_data.get('status') == 'error':
+                            await self.async_logger.log(
+                                logging.WARNING,
+                                f"{c} {interval} is in error state."
+                            )
+                            continue
+                            
                         if kv_data.get('last_processed'):
                             dt = datetime.fromisoformat(kv_data['last_processed'])
-                            dt_pst = convert_to_pst(dt)
-                            if earliest_time is None or dt_pst < earliest_time:
-                                earliest_time = dt_pst
+                            sensor_times[c] = convert_to_pst(dt)
                         else:
                             # If there's no last_processed, use the file path
                             p = kv_data.get('path')
                             if p:
                                 e_time = await self._extract_end_time_from_path(p, interval)
-                                if e_time and (earliest_time is None or e_time < earliest_time):
-                                    earliest_time = e_time
-                    except Exception:
-                        pass
+                                if e_time:
+                                    sensor_times[c] = e_time
+                    except Exception as e:
+                        await self.async_logger.log(
+                            logging.WARNING,
+                            f"Error parsing KV for {c}/{interval}: {e}"
+                        )
                 else:
-                    missing.append(c)
+                    await self.async_logger.log(
+                        logging.INFO,
+                        f"No KV record found for {c} in {interval} interval"
+                    )
             
-            if missing:
-                await self.async_logger.log(
-                    logging.INFO, 
-                    f"No KV records found for sensors {', '.join(missing)} in {interval} interval"
-                )
-                return None
         except Exception as e:
-            await self.async_logger.log(logging.ERROR, f"Error in _get_last_processed_time({interval}): {e}")
-            return None
-        return earliest_time
+            await self.async_logger.log(
+                logging.ERROR,
+                f"Error in _get_last_processed_time({interval}): {e}"
+            )
+        return sensor_times
 
     async def _run_daily_updates(self):
         """
         Runs every midnight PST. We compare what the last 'processed time'
-        was in the KV store, then chunk from there until the current midnight,
+        was in the KV store for each sensor, then chunk from there until the current midnight,
         generating daily images as needed.
         """
         while True:
@@ -814,19 +837,24 @@ class VisualizationService:
                 now_pst = convert_to_pst(now)
                 midn = now_pst.replace(hour=0, minute=0, second=0, microsecond=0)
                 
-                last_proc = await self._get_last_processed_time('daily')
-                if not last_proc:
-                    start_time = midn
-                else:
-                    start_time = last_proc.replace(hour=0, minute=0, second=0, microsecond=0)
-                
+                sensor_times = await self._get_last_processed_time('daily')
                 next_midn = midn + timedelta(days=1)
                 until = min(next_midn, now_pst)
                 
-                if start_time < until:
-                    st = {s['column']: {'last_success':None,'last_error':None} for s in self.sensors}
-                    await self.process_daily_updates(start_time, until, st)
-                    await self._update_kv_records('daily', st)
+                # Process each sensor that needs updating
+                for s in self.sensors:
+                    col = s['column']
+                    last_proc = sensor_times.get(col)
+                    
+                    if not last_proc:
+                        start_time = midn
+                    else:
+                        start_time = last_proc.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    if start_time < until:
+                        st = {col: {'last_success':None,'last_error':None}}
+                        await self.process_daily_updates(start_time, until, st)
+                        await self._update_kv_records('daily', st)
                 
                 # Sleep until the next midnight
                 wait_secs = max(0, (next_midn - now_pst).total_seconds())
@@ -838,7 +866,8 @@ class VisualizationService:
 
     async def _run_hourly_updates(self):
         """
-        Runs every hour on the hour PST. We see what's processed, produce new hourly images if needed, then sleep.
+        Runs every hour on the hour PST. We see what's processed for each sensor,
+        produce new hourly images if needed, then sleep.
         """
         while True:
             try:
@@ -846,19 +875,24 @@ class VisualizationService:
                 now_pst = convert_to_pst(now)
                 hr_top = now_pst.replace(minute=0, second=0, microsecond=0)
                 
-                last_proc = await self._get_last_processed_time('hourly')
-                if not last_proc:
-                    start_time = hr_top
-                else:
-                    start_time = last_proc.replace(minute=0, second=0, microsecond=0)
-                
+                sensor_times = await self._get_last_processed_time('hourly')
                 next_hour = hr_top + timedelta(hours=1)
                 until = min(next_hour, now_pst)
                 
-                if start_time < until:
-                    st = {s['column']: {'last_success':None,'last_error':None} for s in self.sensors}
-                    await self.process_hourly_updates(start_time, until, st)
-                    await self._update_kv_records('hourly', st)
+                # Process each sensor that needs updating
+                for s in self.sensors:
+                    col = s['column']
+                    last_proc = sensor_times.get(col)
+                    
+                    if not last_proc:
+                        start_time = hr_top
+                    else:
+                        start_time = last_proc.replace(minute=0, second=0, microsecond=0)
+                    
+                    if start_time < until:
+                        st = {col: {'last_success':None,'last_error':None}}
+                        await self.process_hourly_updates(start_time, until, st)
+                        await self._update_kv_records('hourly', st)
                 
                 # Sleep until the next hour
                 wait_secs = max(0, (next_hour - now_pst).total_seconds())
@@ -871,9 +905,8 @@ class VisualizationService:
     async def _run_minute_updates(self):
         """
         Runs every hour (offset by +5 minutes from the top of the hour),
-        generating a single all-time minute chart from earliest record to 'now'.
-        This matches the day-by-day logic used in backfill, but condensed into
-        one final image every hour in normal runtime, after hourly completes.
+        generating a single all-time minute chart from earliest record to 'now'
+        for each sensor that needs updating.
         """
         while True:
             try:
@@ -893,18 +926,31 @@ class VisualizationService:
                 now_2 = datetime.now(timezone.utc)
                 now_2_pst = convert_to_pst(now_2)
                 
-                st = {s['column']: {'last_success':None,'last_error':None} for s in self.sensors}
+                sensor_times = await self._get_last_processed_time('minute')
+                data_service = self._get_data_service()
                 
-                # earliest record for the first sensor
-                first_db_record = await self.data_service.get_sensor_data(self.sensors[0]["column"], limit=1)
-                if first_db_record:
+                # Process each sensor that needs updating
+                for s in self.sensors:
+                    col = s['column']
+                    last_proc = sensor_times.get(col)
+                    
+                    # Get earliest record for this sensor
+                    first_db_record = await data_service.get_sensor_data(col, limit=1)
+                    if not first_db_record:
+                        continue
+                    
                     earliest_db_time = first_db_record[0].time
-                else:
-                    earliest_db_time = now_2_pst.astimezone(timezone.utc)
-                
-                # Single all-time chart from earliest_db_time -> now
-                await self.process_minute_updates(earliest_db_time, now_2_pst, st)
-                await self._update_kv_records('minute', st)
+                    
+                    # If we have a last processed time and it's after the earliest record,
+                    # and it's within the last hour, skip this sensor
+                    if (last_proc and 
+                        last_proc > convert_to_pst(earliest_db_time) and
+                        (now_2_pst - last_proc).total_seconds() < 3600):
+                        continue
+                    
+                    st = {col: {'last_success':None,'last_error':None}}
+                    await self.process_minute_updates(earliest_db_time, now_2_pst, st)
+                    await self._update_kv_records('minute', st)
                 
                 # Sleep for 1 hour until next iteration
                 next_cycle = hr_top + timedelta(hours=1)
